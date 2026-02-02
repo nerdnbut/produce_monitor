@@ -210,7 +210,7 @@ def insert_production_record(movie_name, machine_id="", nas_path="", core_table=
         machine_id: 机器标识
         nas_path: NAS路径
         core_table: 核心表名称（自有/外部制作/Default）
-        **kwargs: 其他字段 (app_token, repo_table_id, produce_table_id, etc.)
+        **kwargs: 其他字段 (app_token, repo_table_id, produce_table_id, recognition_merge_start_time, etc.)
 
     Returns:
         int: 新记录的ID，失败返回None
@@ -221,8 +221,8 @@ def insert_production_record(movie_name, machine_id="", nas_path="", core_table=
             sanitized_name = sanitize_movie_name(movie_name)
             sql = """
                 INSERT INTO production_records
-                (movie_name, sanitized_name, machine_id, core_table, nas_path, app_token, repo_table_id, produce_table_id, repo_record_id, produce_record_id)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                (movie_name, sanitized_name, machine_id, core_table, nas_path, app_token, repo_table_id, produce_table_id, repo_record_id, produce_record_id, recognition_merge_start_time)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """
             cursor.execute(sql, (
                 movie_name, sanitized_name, machine_id, core_table, nas_path,
@@ -230,7 +230,8 @@ def insert_production_record(movie_name, machine_id="", nas_path="", core_table=
                 kwargs.get("repo_table_id", ""),
                 kwargs.get("produce_table_id", ""),
                 kwargs.get("repo_record_id", ""),
-                kwargs.get("produce_record_id", "")
+                kwargs.get("produce_record_id", ""),
+                kwargs.get("recognition_merge_start_time")
             ))
         conn.commit()
         return cursor.lastrowid
@@ -248,7 +249,7 @@ def update_production_status(movie_name, status, **kwargs):
     Args:
         movie_name: 剧名（可以是原始剧名或净化后的剧名）
         status: 新状态
-        **kwargs: 其他要更新的字段 (stage, error_msg, quality_metrics, duration_h, subtitle_count, bgm_result, bgm_copyright_count)
+        **kwargs: 其他要更新的字段 (stage, error_msg, quality_metrics, duration_h, subtitle_count, bgm_result, bgm_copyright_count, recognition_merge_end_time)
 
     Returns:
         bool: 更新是否成功（找不到记录时静默跳过，返回True）
@@ -278,6 +279,9 @@ def update_production_status(movie_name, status, **kwargs):
             if "bgm_copyright_count" in kwargs:
                 update_fields.append("bgm_copyright_count = %s")
                 update_values.append(kwargs["bgm_copyright_count"])
+            if "recognition_merge_end_time" in kwargs:
+                update_fields.append("recognition_merge_end_time = %s")
+                update_values.append(kwargs["recognition_merge_end_time"])
 
             # 质量指标
             if "quality_metrics" in kwargs and kwargs["quality_metrics"]:
@@ -680,6 +684,39 @@ def delete_production_log(log_id):
     except Exception as e:
         conn.rollback()
         print(f"删除生产记录失败: {e}")
+        return False
+    finally:
+        conn.close()
+
+def mark_production_record_correct(record_id, recognition_merge_end_time=None):
+    """
+    标记生产记录为正确（状态改为"识别合并完成"）
+    用于处理因缺少某些角色（如男2、女2）而误判为失败的情况
+
+    Args:
+        record_id: 生产记录ID
+        recognition_merge_end_time: 识别合并结束时间（可选，默认使用当前时间）
+
+    Returns:
+        bool: 更新是否成功
+    """
+    from datetime import datetime
+    conn = pool.connection()
+    try:
+        with conn.cursor() as cursor:
+            if recognition_merge_end_time is None:
+                recognition_merge_end_time = datetime.now()
+            sql = """
+                UPDATE production_records
+                SET status = '识别合并完成', stage = '', error_msg = '', recognition_merge_end_time = %s, updated_at = %s
+                WHERE id = %s
+            """
+            cursor.execute(sql, (recognition_merge_end_time, recognition_merge_end_time, record_id))
+        conn.commit()
+        return True
+    except Exception as e:
+        conn.rollback()
+        print(f"标记记录为正确失败: {e}")
         return False
     finally:
         conn.close()
