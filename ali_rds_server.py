@@ -221,8 +221,8 @@ def insert_production_record(movie_name, machine_id="", nas_path="", core_table=
             sanitized_name = sanitize_movie_name(movie_name)
             sql = """
                 INSERT INTO production_records
-                (movie_name, sanitized_name, machine_id, core_table, nas_path, app_token, repo_table_id, produce_table_id, repo_record_id, produce_record_id, recognition_merge_start_time)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                (movie_name, sanitized_name, machine_id, core_table, nas_path, app_token, repo_table_id, produce_table_id, repo_record_id, produce_record_id, recognition_merge_start_time, demand_party)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """
             cursor.execute(sql, (
                 movie_name, sanitized_name, machine_id, core_table, nas_path,
@@ -231,7 +231,8 @@ def insert_production_record(movie_name, machine_id="", nas_path="", core_table=
                 kwargs.get("produce_table_id", ""),
                 kwargs.get("repo_record_id", ""),
                 kwargs.get("produce_record_id", ""),
-                kwargs.get("recognition_merge_start_time")
+                kwargs.get("recognition_merge_start_time"),
+                kwargs.get("demand_party", "")
             ))
         conn.commit()
         return cursor.lastrowid
@@ -304,6 +305,9 @@ def update_production_status(movie_name, status, **kwargs):
                 if "median_h" in metrics:
                     update_fields.append("median_h = %s")
                     update_values.append(metrics["median_h"])
+                if "subtitle_duration_abnormal" in metrics:
+                    update_fields.append("subtitle_duration_abnormal = %s")
+                    update_values.append(json.dumps(metrics["subtitle_duration_abnormal"], ensure_ascii=False))
 
             # 同时匹配原始剧名和净化后的剧名
             sanitized = sanitize_movie_name(movie_name)
