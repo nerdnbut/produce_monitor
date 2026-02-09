@@ -725,6 +725,272 @@ def mark_production_record_correct(record_id, recognition_merge_end_time=None):
     finally:
         conn.close()
 
+# ==================== 请求ID缓存相关函数 ====================
+
+NAS_CACHE_DIR = r"\\172.16.8.9\snapread\小柯"
+REQUEST_ID_FILE = os.path.join(NAS_CACHE_DIR, "request_ids.json")
+
+def clear_request_id_cache(movie_name):
+    """
+    清除指定剧集的请求ID缓存
+    防止重置后使用老的缓存数据
+
+    Args:
+        movie_name: 剧名（可以是原始剧名或净化后的剧名）
+
+    Returns:
+        dict: {"success": bool, "msg": str}
+    """
+    try:
+        # 净化剧名（用于匹配文件夹名）
+        sanitized_name = sanitize_movie_name(movie_name)
+
+        # 检查文件是否存在
+        if not os.path.exists(REQUEST_ID_FILE):
+            return {"success": True, "msg": "缓存文件不存在，无需清除"}
+
+        # 读取现有缓存
+        with open(REQUEST_ID_FILE, "r", encoding="utf-8") as f:
+            cache_data = json.load(f)
+
+        # 检查并删除对应剧名的缓存（支持原始剧名和净化后的剧名）
+        removed_keys = []
+        for key in list(cache_data.keys()):
+            if key == movie_name or key == sanitized_name:
+                removed_keys.append(key)
+                del cache_data[key]
+
+        if not removed_keys:
+            return {"success": True, "msg": "未找到该剧的缓存数据"}
+
+        # 保存更新后的缓存
+        with open(REQUEST_ID_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache_data, f, ensure_ascii=False, indent=4)
+
+        return {
+            "success": True,
+            "msg": f"已清除缓存: {', '.join(removed_keys)}"
+        }
+    except Exception as e:
+        print(f"清除缓存失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"success": False, "error": str(e)}
+
+# ==================== 版权处理日志相关函数 ====================
+
+def insert_copyright_process_log(data):
+    """
+    插入版权处理日志
+
+    Args:
+        data: dict 包含以下字段:
+            - task_id: 任务ID (可选)
+            - channel: 频道名称
+            - video_title: 视频标题
+            - music_names: 音乐名称列表 (JSON字符串)
+            - owner: 版权发起者
+            - status: 状态 (收到邮件/开始处理/部分完成/完成/失败等)
+            - processed_songs: 已处理的音乐列表 (JSON字符串)
+            - failed_count: 失败数量
+            - fail_reason: 失败原因
+            - process_result: 处理结果描述
+            - start_time: 开始时间
+            - end_time: 结束时间 (可选)
+            - email_received_time: 邮件接收时间 (可选)
+            - copyright_type: 版权类型 (【音乐】/【视频】/【版权解除】)
+
+    Returns:
+        int: 新记录的ID，失败返回None
+    """
+    conn = pool.connection()
+    try:
+        with conn.cursor() as cursor:
+            sql = """
+                INSERT INTO copyright_process_logs
+                (task_id, channel, video_title, music_names, owner, status,
+                 processed_songs, failed_count, fail_reason, process_result,
+                 start_time, end_time, email_received_time, copyright_type)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """
+            cursor.execute(sql, (
+                data.get("task_id", ""),
+                data.get("channel", ""),
+                data.get("video_title", ""),
+                json.dumps(data.get("music_names", []), ensure_ascii=False),
+                data.get("owner", ""),
+                data.get("status", ""),
+                json.dumps(data.get("processed_songs", []), ensure_ascii=False),
+                data.get("failed_count", 0),
+                data.get("fail_reason", ""),
+                data.get("process_result", ""),
+                data.get("start_time"),
+                data.get("end_time"),
+                data.get("email_received_time"),
+                data.get("copyright_type", "")
+            ))
+        conn.commit()
+        return cursor.lastrowid
+    except Exception as e:
+        conn.rollback()
+        print(f"插入版权处理日志失败: {e}")
+        return None
+    finally:
+        conn.close()
+
+def update_copyright_process_log(log_id, **kwargs):
+    """
+    更新版权处理日志
+
+    Args:
+        log_id: 日志记录ID
+        **kwargs: 要更新的字段
+
+    Returns:
+        bool: 更新是否成功
+    """
+    if not kwargs:
+        return True
+
+    conn = pool.connection()
+    try:
+        with conn.cursor() as cursor:
+            update_fields = []
+            update_values = []
+
+            field_mapping = {
+                "status": "status",
+                "processed_songs": "processed_songs",
+                "failed_count": "failed_count",
+                "fail_reason": "fail_reason",
+                "process_result": "process_result",
+                "end_time": "end_time",
+                "music_names": "music_names"
+            }
+
+            for key, db_field in field_mapping.items():
+                if key in kwargs:
+                    if key in ["processed_songs", "music_names"]:
+                        update_fields.append(f"{db_field} = %s")
+                        update_values.append(json.dumps(kwargs[key], ensure_ascii=False))
+                    else:
+                        update_fields.append(f"{db_field} = %s")
+                        update_values.append(kwargs[key])
+
+            if not update_fields:
+                return True
+
+            update_values.append(log_id)
+
+            sql = f"UPDATE copyright_process_logs SET {', '.join(update_fields)} WHERE id = %s"
+            cursor.execute(sql, update_values)
+        conn.commit()
+        return True
+    except Exception as e:
+        conn.rollback()
+        print(f"更新版权处理日志失败: {e}")
+        return False
+    finally:
+        conn.close()
+
+def get_copyright_process_logs(channel=None, status=None, copyright_type=None, limit=None):
+    """
+    获取版权处理日志
+
+    Args:
+        channel: 频道名称（可选）
+        status: 状态筛选（可选）
+        copyright_type: 版权类型筛选（可选）
+        limit: 返回数量限制（可选）
+
+    Returns:
+        list: 版权处理日志列表
+    """
+    conn = pool.connection()
+    try:
+        with conn.cursor(pymysql.cursors.DictCursor) as cursor:
+            conditions = []
+            params = []
+
+            if channel:
+                conditions.append("channel = %s")
+                params.append(channel)
+            if status:
+                conditions.append("status = %s")
+                params.append(status)
+            if copyright_type:
+                conditions.append("copyright_type = %s")
+                params.append(copyright_type)
+
+            where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+            limit_clause = f"LIMIT {limit}" if limit else ""
+
+            sql = f"SELECT * FROM copyright_process_logs {where_clause} ORDER BY id DESC {limit_clause}"
+            cursor.execute(sql, params)
+            return cursor.fetchall()
+    except Exception as e:
+        print(f"获取版权处理日志失败: {e}")
+        return []
+    finally:
+        conn.close()
+
+def get_copyright_process_stats():
+    """
+    获取版权处理统计信息
+
+    Returns:
+        dict: 包含统计数据
+    """
+    conn = pool.connection()
+    try:
+        with conn.cursor(pymysql.cursors.DictCursor) as cursor:
+            today = date.today().strftime('%Y-%m-%d')
+
+            # 今日收到邮件数量
+            cursor.execute("""
+                SELECT COUNT(*) as count FROM copyright_process_logs
+                WHERE DATE(email_received_time) = %s
+            """, (today,))
+            today_received = cursor.fetchone()['count']
+
+            # 今日处理完成数量
+            cursor.execute("""
+                SELECT COUNT(*) as count FROM copyright_process_logs
+                WHERE DATE(end_time) = %s AND status IN ('完成', 'DONE')
+            """, (today,))
+            today_completed = cursor.fetchone()['count']
+
+            # 今日处理失败数量
+            cursor.execute("""
+                SELECT COUNT(*) as count FROM copyright_process_logs
+                WHERE DATE(end_time) = %s AND status IN ('失败', 'ERROR')
+            """, (today,))
+            today_failed = cursor.fetchone()['count']
+
+            # 正在处理中数量
+            cursor.execute("""
+                SELECT COUNT(*) as count FROM copyright_process_logs
+                WHERE status IN ('开始处理', '部分完成', 'PROCESSING', 'PENDING')
+            """)
+            processing = cursor.fetchone()['count']
+
+            return {
+                "today_received": today_received,
+                "today_completed": today_completed,
+                "today_failed": today_failed,
+                "processing": processing
+            }
+    except Exception as e:
+        print(f"获取版权处理统计失败: {e}")
+        return {
+            "today_received": 0,
+            "today_completed": 0,
+            "today_failed": 0,
+            "processing": 0
+        }
+    finally:
+        conn.close()
+
 # 使用示例
 if __name__ == "__main__":
     # 测试数据库连接
