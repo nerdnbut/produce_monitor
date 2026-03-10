@@ -256,14 +256,14 @@ def show_copyright_panel():
         df = pd.DataFrame(table_data)
         display_df = df.drop(columns=['raw_log'])
 
-        styled_df = display_df.style.applymap(
+        styled_df = display_df.style.map(
             color_status_copyright,
             subset=['状态']
         )
 
         st.dataframe(
             styled_df,
-            use_container_width=True,
+            width='stretch',
             height=400,
             column_config={
                 "频道": st.column_config.TextColumn("频道", width="small"),
@@ -520,14 +520,14 @@ def show_production_panel():
         display_df = df.drop(columns=['id', 'raw_record'])
 
         # 应用状态颜色
-        styled_df = display_df.style.applymap(
+        styled_df = display_df.style.map(
             color_status,
             subset=['状态']
         )
 
         st.dataframe(
             styled_df,
-            use_container_width=True,
+            width='stretch',
             height=400,
             column_config={
                 "剧名": st.column_config.TextColumn("剧名", width="medium"),

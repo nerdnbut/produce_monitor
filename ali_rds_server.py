@@ -107,13 +107,16 @@ def insert_production_log(data):
                 used_volc_ocr = quality_metrics.get("used_volc_ocr", False)
                 # 字幕高度中位数（仅本地OCR有值）
                 median_h = quality_metrics.get("median_h", None)
+                # 时长一致性检查结果
+                duration_consistency = quality_metrics.get("duration_consistency")
+                duration_consistency_json = json.dumps(duration_consistency, ensure_ascii=False) if duration_consistency else "{}"
 
             c.execute('''INSERT INTO production_logs (
                 machine_id, module, core_table, movie_name, status, stage, nas_path, error_msg,
                 app_token, repo_table_id, produce_table_id, repo_record_id, produce_record_id,
                 ocr_check_pass, role_source_distribution, role_ratio_stats, av_sync_result, used_volc_ocr, median_h,
-                duration_h, subtitle_count
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''', (
+                duration_h, subtitle_count, duration_consistency
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)''', (
                 data.get("machine_id", ""),
                 data.get("module", ""),
                 data.get("core_table", "Default"),
@@ -128,7 +131,7 @@ def insert_production_log(data):
                 data.get("repo_record_id", ""),
                 data.get("produce_record_id", ""),
                 ocr_pass, source_dist, ratio_stats, av_sync_result, used_volc_ocr, median_h,
-                duration_h, subtitle_count
+                duration_h, subtitle_count, duration_consistency_json
             ))
         conn.commit()
         return True
@@ -308,6 +311,9 @@ def update_production_status(movie_name, status, **kwargs):
                 if "subtitle_duration_abnormal" in metrics:
                     update_fields.append("subtitle_duration_abnormal = %s")
                     update_values.append(json.dumps(metrics["subtitle_duration_abnormal"], ensure_ascii=False))
+                if "duration_consistency" in metrics:
+                    update_fields.append("duration_consistency = %s")
+                    update_values.append(json.dumps(metrics["duration_consistency"], ensure_ascii=False))
 
             # 同时匹配原始剧名和净化后的剧名
             sanitized = sanitize_movie_name(movie_name)
