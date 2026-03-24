@@ -316,7 +316,7 @@ def show_copyright_panel():
 def show_production_panel():
     """显示生产监控面板（原有代码）"""
     # 筛选区域
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
 
     with col1:
         search_name = st.text_input("🔍 剧名搜索", placeholder="输入剧名...")
@@ -324,7 +324,7 @@ def show_production_panel():
     with col2:
         status_filter = st.selectbox(
             "📌 状态筛选",
-            ["全部", "识别合并中", "识别合并完成", "处理BGM中", "BGM完成", "配音中", "配音完成", "失败"]
+            ["全部", "识别合并中", "识别合并完成", "处理BGM中", "已完成", "失败"]
         )
 
     with col3:
@@ -337,6 +337,12 @@ def show_production_panel():
         machine_filter = st.selectbox(
             "🖥️ 机器筛选",
             ["全部"] + get_all_machines()
+        )
+
+    with col5:
+        delay_filter = st.selectbox(
+            "⏰ 延期筛选",
+            ["全部", "延期1天以上", "延期7天以上"]
         )
 
     # 筛选数据
@@ -363,6 +369,16 @@ def show_production_panel():
 
     if machine_filter != "全部":
         filtered_records = [r for r in filtered_records if r.get('machine_id') == machine_filter]
+
+    if delay_filter != "全部":
+        now = datetime.now()
+        delay_days = 1 if "延期1天以上" in delay_filter else 7
+        filtered_records = [
+            r for r in filtered_records
+            if r.get('due_date')
+            and r.get('status') != '已完成'
+            and now > datetime.fromtimestamp(r.get('due_date') / 1000) + timedelta(days=delay_days)
+        ]
 
     # === 构建表格数据 ===
     table_data = []
@@ -424,7 +440,7 @@ def show_production_panel():
         elif status not in ['识别合并完成', 'BGM完成']:
             end_time_str = "进行中"
 
-        # 计算耗时（小时）
+        # 计算识别耗时（小时）
         if recognition_merge_start_time and recognition_merge_end_time:
             try:
                 if hasattr(recognition_merge_start_time, 'total_seconds'):
@@ -440,6 +456,23 @@ def show_production_panel():
                 pass
         else:
             duration_str = "-"
+
+        # 计算总耗时（从开始到BGM完成）
+        bgm_end_time = record.get('bgm_end_time')
+        total_duration_str = "-"
+        if recognition_merge_start_time and bgm_end_time:
+            try:
+                if hasattr(recognition_merge_start_time, 'total_seconds'):
+                    total_duration_sec = (bgm_end_time - recognition_merge_start_time).total_seconds()
+                else:
+                    start_dt = datetime.fromisoformat(str(recognition_merge_start_time)) if isinstance(recognition_merge_start_time, str) else recognition_merge_start_time
+                    end_dt = datetime.fromisoformat(str(bgm_end_time)) if isinstance(bgm_end_time, str) else bgm_end_time
+                    total_duration_sec = (end_dt - start_dt).total_seconds()
+                if total_duration_sec > 0:
+                    total_duration_hours = total_duration_sec / 3600
+                    total_duration_str = f"{total_duration_hours:.2f}h"
+            except:
+                pass
 
         # 格式化角色来源
         source_str = ", ".join([f"{k}:{v}" for k, v in role_source.items()]) if role_source else "-"
@@ -484,6 +517,7 @@ def show_production_panel():
             "开始时间": str(start_time_str),
             "结束时间": str(end_time_str),
             "识别耗时": str(duration_str),
+            "总耗时": str(total_duration_str),
             "OCR类型": str("火山" if record.get('used_volc_ocr') else "本地"),
             "OCR检查": str("通过" if record.get('ocr_check_pass') else "异常" if record.get('ocr_check_pass') is not None else "-"),
             "字幕高度": str(f"{record.get('median_h'):.0f}px") if record.get('median_h') else "-",
@@ -505,7 +539,7 @@ def show_production_panel():
     if table_data:
         # 状态颜色映射
         def color_status(val):
-            if val == "配音完成":
+            if val == "已完成" or val == "配音完成":
                 return "background-color: #d4edda"
             elif val == "失败":
                 return "background-color: #f8d7da"
@@ -539,6 +573,7 @@ def show_production_panel():
                 "开始时间": st.column_config.TextColumn("开始时间", width="small"),
                 "结束时间": st.column_config.TextColumn("结束时间", width="small"),
                 "识别耗时": st.column_config.TextColumn("识别耗时", width="small"),
+                "总耗时": st.column_config.TextColumn("总耗时", width="small"),
                 "OCR类型": st.column_config.TextColumn("OCR", width="small"),
                 "OCR检查": st.column_config.TextColumn("OCR检查", width="small"),
                 "字幕高度": st.column_config.TextColumn("字幕高度", width="small"),

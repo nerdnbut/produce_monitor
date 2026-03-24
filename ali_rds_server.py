@@ -224,8 +224,8 @@ def insert_production_record(movie_name, machine_id="", nas_path="", core_table=
             sanitized_name = sanitize_movie_name(movie_name)
             sql = """
                 INSERT INTO production_records
-                (movie_name, sanitized_name, machine_id, core_table, nas_path, app_token, repo_table_id, produce_table_id, repo_record_id, produce_record_id, recognition_merge_start_time, demand_party)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                (movie_name, sanitized_name, machine_id, core_table, nas_path, app_token, repo_table_id, produce_table_id, repo_record_id, produce_record_id, recognition_merge_start_time, demand_party, due_date)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """
             cursor.execute(sql, (
                 movie_name, sanitized_name, machine_id, core_table, nas_path,
@@ -235,7 +235,8 @@ def insert_production_record(movie_name, machine_id="", nas_path="", core_table=
                 kwargs.get("repo_record_id", ""),
                 kwargs.get("produce_record_id", ""),
                 kwargs.get("recognition_merge_start_time"),
-                kwargs.get("demand_party", "")
+                kwargs.get("demand_party", ""),
+                kwargs.get("due_date")
             ))
         conn.commit()
         return cursor.lastrowid
@@ -286,6 +287,9 @@ def update_production_status(movie_name, status, **kwargs):
             if "recognition_merge_end_time" in kwargs:
                 update_fields.append("recognition_merge_end_time = %s")
                 update_values.append(kwargs["recognition_merge_end_time"])
+            if "bgm_end_time" in kwargs:
+                update_fields.append("bgm_end_time = %s")
+                update_values.append(kwargs["bgm_end_time"])
 
             # 质量指标
             if "quality_metrics" in kwargs and kwargs["quality_metrics"]:
