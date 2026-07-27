@@ -10,16 +10,25 @@
 """
 import sys
 import os
+import json
+import threading
+import time
 import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
 from collections import defaultdict
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    ZoneInfo = None
 
 # 添加项目根目录到路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from youtube_data.lark import LarkBitableClient, Condition
 from factory.table_manager import CORE_TABLES
+from youtube_data.lark_message import LarkMessage
 
 # pyecharts 导入
 from pyecharts.charts import Bar, Pie, Funnel, Line, Grid
@@ -31,6 +40,18 @@ import streamlit.components.v1 as components
 # 系统配置
 SYSTEMS = ["众益", "点众", "红果", "掌阅", "外部制作", "ReelShort"]
 
+# 生产日报自动发送配置：周一/周五 19 点发送一次
+DAILY_REPORT_CHAT_ID = "oc_471f224b62b9acad8ffc4433cc687add"
+AUTO_REPORT_WEEKDAYS = {0, 4}
+AUTO_REPORT_HOUR = 19
+AUTO_REPORT_CHECK_INTERVAL_SECONDS = 60
+AUTO_REPORT_STATE_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "auto_daily_report_state.json"
+)
+AUTO_REPORT_LOCK = threading.Lock()
+LOCAL_TIMEZONE = ZoneInfo("Asia/Shanghai") if ZoneInfo else None
+
 # 剧识别表需要查询的字段
 RECOGNITION_FIELDS = [
     "剧id", "剧名", "生产状态", "整备状态", "生产机器",
@@ -39,6 +60,11 @@ RECOGNITION_FIELDS = [
     "角色识别报告", "角色分布比例", "剧字幕条数",
     "备注", "失败类型", "预计发布日期", "BGM处理情况", "生产周期",
     "BGM开始处理时间", "处理BGM结束时间", "生产总耗时", "NAS位置"
+]
+
+# 剧制作表-新需要查询的字段（用于配音情况统计）
+PRODUCTION_FIELDS = [
+    "剧名", "当前状态", "当前制作周期", "语言", "制作备注", "制作耗时小时"
 ]
 
 # 颜色主题
@@ -107,17 +133,48 @@ def fetch_recognition_data(system_name: str) -> list:
         return []
 
 
-@st.cache_data(ttl=300)
-def fetch_all_systems_data() -> pd.DataFrame:
+@st.cache_data(ttl=300)  # 缓存5分钟
+def fetch_production_data(system_name: str) -> list:
     """
-    拉取所有系统的剧识别表数据
+    从指定系统的剧制作表-新拉取所有数据（用于配音情况统计）
     """
-    all_records = []
+    try:
+        config = CORE_TABLES.get(system_name)
+        if not config:
+            return []
 
-    for system_name in SYSTEMS:
-        records = fetch_recognition_data(system_name)
-        all_records.extend(records)
+        app_token = config.get("app_token")
+        tables = config.get("tables", {})
+        production_table_id = tables.get("剧制作表-新")
 
+        if not production_table_id:
+            return []
+
+        client = LarkBitableClient()
+
+        records = client.search_all_records(
+            app_token=app_token,
+            table_id=production_table_id,
+            field_names=PRODUCTION_FIELDS,
+            filter_conditions=[]
+        )
+
+        for record in records:
+            record["系统"] = system_name
+
+        return records
+
+    except Exception as e:
+        import traceback
+        print(f"拉取 [{system_name}] 剧制作表数据失败: {e}")
+        print(traceback.format_exc())
+        return []
+
+
+def _recognition_records_to_dataframe(all_records: list) -> pd.DataFrame:
+    """
+    将剧识别表记录转换为面板使用的 DataFrame
+    """
     if not all_records:
         return pd.DataFrame()
 
@@ -152,7 +209,108 @@ def fetch_all_systems_data() -> pd.DataFrame:
         }
         rows.append(row)
 
+    return pd.DataFrame(rows)
+
+
+def fetch_all_systems_data_for_auto_report() -> pd.DataFrame:
+    """
+    后台自动日报专用的数据拉取，不依赖 Streamlit 页面上下文
+    """
+    all_records = []
+
+    for system_name in SYSTEMS:
+        try:
+            config = CORE_TABLES.get(system_name)
+            if not config:
+                continue
+
+            app_token = config.get("app_token")
+            tables = config.get("tables", {})
+            recognition_table_id = tables.get("剧识别表")
+
+            if not recognition_table_id:
+                continue
+
+            client = LarkBitableClient()
+            records = client.search_all_records(
+                app_token=app_token,
+                table_id=recognition_table_id,
+                field_names=RECOGNITION_FIELDS,
+                filter_conditions=[]
+            )
+
+            for record in records:
+                record["系统"] = system_name
+
+            all_records.extend(records)
+
+        except Exception as e:
+            print(f"自动日报拉取 [{system_name}] 数据失败: {e}")
+
+    return _recognition_records_to_dataframe(all_records)
+
+
+@st.cache_data(ttl=300)
+def fetch_all_systems_data() -> pd.DataFrame:
+    """
+    拉取所有系统的剧识别表数据
+    """
+    all_records = []
+
+    for system_name in SYSTEMS:
+        records = fetch_recognition_data(system_name)
+        all_records.extend(records)
+
+    return _recognition_records_to_dataframe(all_records)
+
+
+@st.cache_data(ttl=300)
+def fetch_all_systems_production_data() -> pd.DataFrame:
+    """
+    拉取所有系统的剧制作表-新数据（用于配音情况统计）
+    只保留最近四个生产周期的记录，减少数据量
+    """
+    all_records = []
+
+    for system_name in SYSTEMS:
+        records = fetch_production_data(system_name)
+        all_records.extend(records)
+
+    if not all_records:
+        return pd.DataFrame()
+
+    rows = []
+    for record in all_records:
+        fields = record.get("fields", {})
+        row = {
+            "record_id": record.get("record_id"),
+            "系统": record.get("系统"),
+            "剧名": _extract_text(fields.get("剧名")),
+            "当前状态": _extract_text(fields.get("当前状态")),
+            "当前制作周期": _extract_text(fields.get("当前制作周期")),
+            "语言": _extract_text(fields.get("语言")),
+            "制作备注": _extract_text(fields.get("制作备注")),
+            "制作耗时小时": fields.get("制作耗时小时"),
+        }
+        rows.append(row)
+
     df = pd.DataFrame(rows)
+
+    # 筛选最近四个生产周期的记录
+    if not df.empty and "当前制作周期" in df.columns:
+        # 获取所有非空的周期
+        all_cycles = df["当前制作周期"].dropna().unique().tolist()
+        # 过滤掉空字符串
+        all_cycles = [c for c in all_cycles if c]
+        # 按周期降序排序（周期格式为YYYYMMDD，字符串排序即可）
+        all_cycles_sorted = sorted(all_cycles, reverse=True)
+        # 取最近四个周期
+        recent_cycles = all_cycles_sorted[:4]
+
+        if recent_cycles:
+            # 筛选只保留最近四个周期的数据
+            df = df[df["当前制作周期"].isin(recent_cycles)]
+
     return df
 
 
@@ -181,6 +339,13 @@ def _parse_timestamp(timestamp):
         return timestamp
     except:
         return None
+
+
+def get_local_now() -> datetime:
+    """获取北京时间；不支持 zoneinfo 时退回系统本地时间"""
+    if LOCAL_TIMEZONE:
+        return datetime.now(LOCAL_TIMEZONE).replace(tzinfo=None)
+    return datetime.now()
 
 
 def create_kpi_card(title, value, delta=None, color="#5470c6"):
@@ -243,6 +408,150 @@ def calculate_avg_times(df: pd.DataFrame) -> dict:
         "avg_bgm_time": completed_df["BGM耗时"].dropna().mean(),
         "avg_total_time": completed_df["生产总耗时"].dropna().mean(),
     }
+
+
+def calculate_avg_recognition_time(df: pd.DataFrame) -> dict:
+    """
+    计算识别角色耗时统计
+    筛选条件：
+    - 开始生产时间、识别角色结束时间字段都不为空
+
+    注意：不限制生产状态，只要有这两个时间字段就可以计算
+
+    返回:
+        dict: {
+            "avg_recognition_time": 总体平均识别角色耗时,
+            "valid_count": 总体有效记录数,
+            "avg_time_no_error": 识别时无报错的平均耗时,
+            "count_no_error": 识别时无报错的记录数,
+            "avg_time_with_error": 识别时有报错的平均耗时,
+            "count_with_error": 识别时有报错的记录数,
+            "error_type_distribution": 失败类型占比字典 {失败类型: 数量},
+        }
+    """
+    # 筛选两个字段都不为空的记录
+    valid_df = df[
+        df["开始生产时间"].notna() &
+        df["识别角色结束时间"].notna()
+    ].copy()
+
+    if valid_df.empty:
+        return {
+            "avg_recognition_time": None,
+            "valid_count": 0,
+            "avg_time_no_error": None,
+            "count_no_error": 0,
+            "avg_time_with_error": None,
+            "count_with_error": 0,
+            "error_type_distribution": {},
+        }
+
+    # 计算识别角色耗时（识别角色结束时间 - 开始生产时间），单位：小时
+    valid_df["识别角色耗时"] = valid_df.apply(
+        lambda row: (row["识别角色结束时间"] - row["开始生产时间"]).total_seconds() / 3600,
+        axis=1
+    )
+
+    # 过滤掉异常值（负数或超大值）
+    valid_df = valid_df[(valid_df["识别角色耗时"] >= 0) & (valid_df["识别角色耗时"] < 1000)]
+
+    if valid_df.empty:
+        return {
+            "avg_recognition_time": None,
+            "valid_count": 0,
+            "avg_time_no_error": None,
+            "count_no_error": 0,
+            "avg_time_with_error": None,
+            "count_with_error": 0,
+            "error_type_distribution": {},
+        }
+
+    # 计算总体平均值
+    avg_time = valid_df["识别角色耗时"].mean()
+    valid_count = len(valid_df)
+
+    # 区分识别时无报错和有报错
+    # 无报错：失败类型为空或NaN
+    no_error_df = valid_df[
+        valid_df["失败类型"].isna() | (valid_df["失败类型"] == "")
+    ].copy()
+    # 有报错：失败类型不为空
+    with_error_df = valid_df[
+        valid_df["失败类型"].notna() & (valid_df["失败类型"] != "")
+    ].copy()
+
+    # 计算无报错的平均耗时
+    avg_time_no_error = no_error_df["识别角色耗时"].mean() if not no_error_df.empty else None
+    count_no_error = len(no_error_df)
+
+    # 计算有报错的平均耗时
+    avg_time_with_error = with_error_df["识别角色耗时"].mean() if not with_error_df.empty else None
+    count_with_error = len(with_error_df)
+
+    # 统计失败类型分布（只统计有报错的记录）
+    error_type_distribution = {}
+    if not with_error_df.empty:
+        error_type_counts = with_error_df["失败类型"].value_counts()
+        error_type_distribution = error_type_counts.to_dict()
+
+    return {
+        "avg_recognition_time": avg_time,
+        "valid_count": valid_count,
+        "avg_time_no_error": avg_time_no_error,
+        "count_no_error": count_no_error,
+        "avg_time_with_error": avg_time_with_error,
+        "count_with_error": count_with_error,
+        "error_type_distribution": error_type_distribution,
+    }
+
+
+def calculate_cycle_recognition_time(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    计算每个生产周期的平均识别角色耗时
+    筛选条件同上
+    """
+    # 筛选两个字段都不为空且有生产周期的记录
+    valid_df = df[
+        df["开始生产时间"].notna() &
+        df["识别角色结束时间"].notna() &
+        df["生产周期"].notna()
+    ].copy()
+
+    if valid_df.empty:
+        return pd.DataFrame()
+
+    # 计算识别角色耗时
+    valid_df["识别角色耗时"] = valid_df.apply(
+        lambda row: (row["识别角色结束时间"] - row["开始生产时间"]).total_seconds() / 3600,
+        axis=1
+    )
+
+    # 过滤掉异常值
+    valid_df = valid_df[(valid_df["识别角色耗时"] >= 0) & (valid_df["识别角色耗时"] < 1000)]
+
+    if valid_df.empty:
+        return pd.DataFrame()
+
+    # 过滤掉超过当前周期的未来周期
+    current_cycle = get_current_cycle()
+    valid_df = valid_df[valid_df["生产周期"] <= current_cycle]
+
+    if valid_df.empty:
+        return pd.DataFrame()
+
+    # 按生产周期分组计算平均值
+    cycle_stats = valid_df.groupby("生产周期").agg(
+        平均识别角色耗时=("识别角色耗时", "mean"),
+        记录数=("识别角色耗时", "count")
+    ).reset_index()
+
+    # 过滤掉没有有效数据的周期
+    cycle_stats = cycle_stats[cycle_stats["平均识别角色耗时"].notna()]
+
+    # 按周期排序
+    cycle_stats = cycle_stats.sort_values("生产周期")
+
+    return cycle_stats
 
 
 def calculate_avg_production_time(df: pd.DataFrame) -> dict:
@@ -316,6 +625,14 @@ def calculate_cycle_production_time(df: pd.DataFrame) -> pd.DataFrame:
     if valid_df.empty:
         return pd.DataFrame()
 
+    # 过滤掉超过当前周期的未来周期
+    # 当前周期 = 本周五（无论今天是周几）
+    current_cycle = get_current_cycle()
+    valid_df = valid_df[valid_df["生产周期"] <= current_cycle]
+
+    if valid_df.empty:
+        return pd.DataFrame()
+
     # 按生产周期分组计算平均值
     cycle_stats = valid_df.groupby("生产周期").agg(
         平均生产总耗时=("生产总耗时", "mean"),
@@ -329,6 +646,202 @@ def calculate_cycle_production_time(df: pd.DataFrame) -> pd.DataFrame:
     cycle_stats = cycle_stats.sort_values("生产周期")
 
     return cycle_stats
+
+
+def calculate_cycle_weekday_production_time(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    计算每个生产周期中不同入表时间窗口的平均生产总耗时
+    - 周一线：上个周五至本周一入表的记录
+    - 周五线：上个周五至本周五入表的记录
+    """
+    if df.empty:
+        return pd.DataFrame()
+
+    required_cols = [
+        "生产状态", "生产周期", "入表时间", "生产总耗时",
+        "开始生产时间", "识别角色结束时间", "BGM开始处理时间", "处理BGM结束时间"
+    ]
+    if any(col not in df.columns for col in required_cols):
+        return pd.DataFrame()
+
+    current_cycle = get_current_cycle()
+    all_cycles = df["生产周期"].dropna().astype(str).str.strip()
+    all_cycles = sorted([cycle for cycle in all_cycles.unique().tolist() if cycle and cycle <= current_cycle])
+
+    if not all_cycles:
+        return pd.DataFrame()
+
+    completed_df = df[df["生产状态"] == "完成"].copy()
+    valid_df = completed_df[
+        completed_df["生产周期"].notna() &
+        completed_df["入表时间"].notna() &
+        completed_df["生产总耗时"].notna() &
+        completed_df["开始生产时间"].notna() &
+        completed_df["识别角色结束时间"].notna() &
+        completed_df["BGM开始处理时间"].notna() &
+        completed_df["处理BGM结束时间"].notna()
+    ].copy()
+
+    if valid_df.empty:
+        return pd.DataFrame()
+
+    valid_df["生产周期"] = valid_df["生产周期"].astype(str).str.strip()
+    valid_df = valid_df[valid_df["生产周期"].isin(all_cycles)]
+    valid_df["入表时间"] = pd.to_datetime(valid_df["入表时间"], errors="coerce")
+    valid_df["生产总耗时"] = pd.to_numeric(valid_df["生产总耗时"], errors="coerce")
+    valid_df = valid_df[
+        valid_df["入表时间"].notna() &
+        valid_df["生产总耗时"].notna() &
+        (valid_df["生产总耗时"] >= 0) &
+        (valid_df["生产总耗时"] < 1000)
+    ].copy()
+
+    if valid_df.empty:
+        return pd.DataFrame()
+
+    valid_df["入表日期"] = valid_df["入表时间"].dt.date
+
+    rows = []
+    for cycle in all_cycles:
+        try:
+            cycle_friday = datetime.strptime(cycle, "%Y%m%d").date()
+        except ValueError:
+            continue
+
+        last_friday = cycle_friday - timedelta(days=7)
+        cycle_monday = last_friday + timedelta(days=3)
+        cycle_df = valid_df[valid_df["生产周期"] == cycle]
+        monday_df = cycle_df[
+            (cycle_df["入表日期"] >= last_friday) &
+            (cycle_df["入表日期"] <= cycle_monday)
+        ]
+        friday_df = cycle_df[
+            (cycle_df["入表日期"] >= last_friday) &
+            (cycle_df["入表日期"] <= cycle_friday)
+        ]
+
+        row = {
+            "生产周期": cycle,
+            "周一平均生产总耗时": monday_df["生产总耗时"].mean() if not monday_df.empty else None,
+            "周五平均生产总耗时": friday_df["生产总耗时"].mean() if not friday_df.empty else None,
+            "周一记录数": len(monday_df),
+            "周五记录数": len(friday_df),
+            "周一统计范围": f"{last_friday.strftime('%m-%d')}~{cycle_monday.strftime('%m-%d')}",
+            "周五统计范围": f"{last_friday.strftime('%m-%d')}~{cycle_friday.strftime('%m-%d')}",
+        }
+        rows.append(row)
+
+    result = pd.DataFrame(rows)
+    if result.empty:
+        return pd.DataFrame()
+
+    result = result[
+        result["周一平均生产总耗时"].notna() |
+        result["周五平均生产总耗时"].notna()
+    ]
+
+    return result
+
+
+def calculate_cycle_completion_rate(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    计算每个生产周期的完成率
+    完成率 = 生产状态为完成的记录数 / 周期总记录数
+    """
+    if df.empty or "生产周期" not in df.columns or "生产状态" not in df.columns:
+        return pd.DataFrame()
+
+    valid_df = df[df["生产周期"].notna()].copy()
+    if valid_df.empty:
+        return pd.DataFrame()
+
+    current_cycle = get_current_cycle()
+    valid_df["生产周期"] = valid_df["生产周期"].astype(str).str.strip()
+    valid_df = valid_df[(valid_df["生产周期"] != "") & (valid_df["生产周期"] <= current_cycle)]
+
+    if valid_df.empty:
+        return pd.DataFrame()
+
+    cycle_stats = valid_df.groupby("生产周期").agg(
+        总数=("生产状态", "size"),
+        已完成=("生产状态", lambda x: (x == "完成").sum())
+    ).reset_index()
+    cycle_stats["完成率"] = cycle_stats.apply(
+        lambda row: row["已完成"] / row["总数"] * 100 if row["总数"] else 0,
+        axis=1
+    )
+    cycle_stats = cycle_stats.sort_values("生产周期")
+
+    return cycle_stats
+
+
+def calculate_dubbing_production_time(production_df: pd.DataFrame) -> dict:
+    """
+    计算剧制作表-新的制作耗时统计
+    筛选条件：制作耗时小时不为空且不为0
+
+    返回:
+        dict: {
+            "avg_time": 平均制作耗时,
+            "valid_count": 有效记录数,
+            "cycle_stats": 各周期统计DataFrame,
+            "system_cycle_stats": 各系统各周期统计DataFrame
+        }
+    """
+    if production_df.empty:
+        return {
+            "avg_time": None,
+            "valid_count": 0,
+            "cycle_stats": pd.DataFrame(),
+            "system_cycle_stats": pd.DataFrame()
+        }
+
+    # 筛选有效记录：制作耗时小时不为空且不为0
+    valid_df = production_df[
+        production_df["制作耗时小时"].notna() &
+        (production_df["制作耗时小时"] != 0)
+    ].copy()
+
+    if valid_df.empty:
+        return {
+            "avg_time": None,
+            "valid_count": 0,
+            "cycle_stats": pd.DataFrame(),
+            "system_cycle_stats": pd.DataFrame()
+        }
+
+    # 计算总体平均值
+    avg_time = valid_df["制作耗时小时"].mean()
+    valid_count = len(valid_df)
+
+    # 按周期统计
+    cycle_stats = pd.DataFrame()
+    system_cycle_stats = pd.DataFrame()
+
+    if "当前制作周期" in valid_df.columns:
+        cycle_valid_df = valid_df[valid_df["当前制作周期"].notna()]
+
+        if not cycle_valid_df.empty:
+            # 各周期平均耗时
+            cycle_stats = cycle_valid_df.groupby("当前制作周期").agg(
+                平均制作耗时=("制作耗时小时", "mean"),
+                记录数=("制作耗时小时", "count")
+            ).reset_index()
+            cycle_stats = cycle_stats.sort_values("当前制作周期")
+
+            # 各系统各周期平均耗时
+            system_cycle_stats = cycle_valid_df.groupby(["系统", "当前制作周期"]).agg(
+                平均制作耗时=("制作耗时小时", "mean"),
+                记录数=("制作耗时小时", "count")
+            ).reset_index()
+            system_cycle_stats = system_cycle_stats.sort_values(["系统", "当前制作周期"])
+
+    return {
+        "avg_time": avg_time,
+        "valid_count": valid_count,
+        "cycle_stats": cycle_stats,
+        "system_cycle_stats": system_cycle_stats
+    }
 
 
 def estimate_completion_time(row: pd.Series, avg_times: dict) -> str:
@@ -361,6 +874,256 @@ def estimate_completion_time(row: pd.Series, avg_times: dict) -> str:
     return "未知状态"
 
 
+def build_daily_report_message(df: pd.DataFrame, current_cycle: str) -> str:
+    """
+    构建生产日报消息正文
+    """
+    # 排除外部制作系统
+    report_systems = [s for s in SYSTEMS if s != "外部制作"]
+
+    # 筛选当前周期的数据
+    current_cycle_df = df[df["生产周期"] == current_cycle]
+
+    message_lines = [f"📋【生产日报】周期 {current_cycle}", ""]
+
+    total_all = 0
+    completed_all = 0
+    processing_all = 0
+    failed_all = 0
+    handling_all = 0
+    abnormal_all = 0
+    waiting_all = 0
+    other_all = 0
+
+    failed_details = []
+    handling_details = []
+
+    for system in report_systems:
+        system_df = current_cycle_df[current_cycle_df["系统"] == system]
+        if system_df.empty:
+            continue
+
+        sys_total = len(system_df)
+        sys_completed = len(system_df[system_df["生产状态"] == "完成"])
+        sys_processing = len(system_df[system_df["生产状态"].isin([
+            "合并视频", "识别字幕", "识别角色", "处理BGM", "识别完成"
+        ])])
+        sys_failed = len(system_df[system_df["生产状态"].isin(["失败", "处理BGM失败"])])
+        sys_handling = len(system_df[system_df["生产状态"] == "失败处理中"])
+        not_started = system_df[system_df["生产状态"] == "未开始"]
+        abnormal_mask = (
+            (not_started["整备状态"].isna() | (not_started["整备状态"] == "")) |
+            (not_started["NAS位置"].isna() | (not_started["NAS位置"] == ""))
+        )
+        waiting_mask = (~abnormal_mask) & (not_started["整备状态"] == "文件结构已对齐")
+        sys_abnormal = len(not_started[abnormal_mask])
+        sys_waiting = len(not_started[waiting_mask])
+        sys_other = sys_total - (
+            sys_completed + sys_processing + sys_failed + sys_handling + sys_abnormal + sys_waiting
+        )
+
+        total_all += sys_total
+        completed_all += sys_completed
+        processing_all += sys_processing
+        failed_all += sys_failed
+        handling_all += sys_handling
+        abnormal_all += sys_abnormal
+        waiting_all += sys_waiting
+        other_all += sys_other
+
+        for _, row in system_df[system_df["生产状态"].isin(["失败", "处理BGM失败"])].iterrows():
+            failed_details.append(f"{system}-{row.get('剧名', '未知')}")
+        for _, row in system_df[system_df["生产状态"] == "失败处理中"].iterrows():
+            handling_details.append(f"{system}-{row.get('剧名', '未知')}")
+
+        message_lines.append(f"🏢 {system}：")
+        message_lines.append(f"  总数 {sys_total} | 完成 {sys_completed} | 生产中 {sys_processing} | 失败 {sys_failed} | 失败处理中 {sys_handling} | 缺少资源 {sys_abnormal} | 等待识别 {sys_waiting} | 其他未完成 {sys_other}")
+
+    message_lines.insert(1, f"📊 汇总：总数 {total_all} | 完成 {completed_all} | 生产中 {processing_all} | 失败 {failed_all} | 失败处理中 {handling_all} | 缺少资源 {abnormal_all} | 等待识别 {waiting_all} | 其他未完成 {other_all}")
+    message_lines.insert(2, "")
+
+    if failed_details:
+        message_lines.append("")
+        message_lines.append(f"❌ 失败待处理记录（{len(failed_details)}部）：")
+        for detail in failed_details[:20]:
+            message_lines.append(f"  - {detail}")
+        if len(failed_details) > 20:
+            message_lines.append(f"  ... 共 {len(failed_details)} 部")
+
+    if handling_details:
+        message_lines.append("")
+        message_lines.append(f"🔄 失败处理中（{len(handling_details)}部）：")
+        for detail in handling_details[:20]:
+            message_lines.append(f"  - {detail}")
+        if len(handling_details) > 20:
+            message_lines.append(f"  ... 共 {len(handling_details)} 部")
+
+    return "\n".join(message_lines)
+
+
+def send_custom_report_to_group(content: str):
+    """
+    发送自定义内容到飞书群组
+    """
+    try:
+        lark_message_client = LarkMessage()
+
+        lark_message_client.send_message(DAILY_REPORT_CHAT_ID, content)
+
+        return True, "日报已发送成功"
+
+    except Exception as e:
+        return False, f"发送失败: {str(e)}"
+
+
+def send_daily_report_to_group(df: pd.DataFrame, current_cycle: str):
+    """
+    发送生产日报到飞书群组
+
+    统计内容：
+    - 各系统当前生产周期的生产情况
+    - 总数、已整备完成、失败、失败处理中、整备异常、等待进入识别
+    - 不统计外部制作系统
+    """
+    try:
+        lark_message_client = LarkMessage()
+
+        # 发送消息
+        message = build_daily_report_message(df, current_cycle)
+        lark_message_client.send_message(DAILY_REPORT_CHAT_ID, message)
+
+        return True, "日报已发送成功"
+
+    except Exception as e:
+        return False, f"发送失败: {str(e)}"
+
+
+def _load_auto_report_state() -> dict:
+    """读取自动日报发送状态"""
+    if not os.path.exists(AUTO_REPORT_STATE_FILE):
+        return {}
+
+    try:
+        with open(AUTO_REPORT_STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"读取自动日报状态失败: {e}")
+        return {}
+
+
+def _save_auto_report_state(state: dict):
+    """保存自动日报发送状态"""
+    try:
+        tmp_file = f"{AUTO_REPORT_STATE_FILE}.tmp"
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_file, AUTO_REPORT_STATE_FILE)
+    except Exception as e:
+        print(f"保存自动日报状态失败: {e}")
+
+
+def _is_recent_auto_report_sending(state_item: dict, now: datetime) -> bool:
+    """判断是否已有一个近期开启的发送任务，避免并发重复发送"""
+    if state_item.get("status") != "sending":
+        return False
+
+    updated_at = state_item.get("updated_at")
+    if not updated_at:
+        return False
+
+    try:
+        updated_time = datetime.strptime(updated_at, "%Y-%m-%d %H:%M:%S")
+        return (now - updated_time).total_seconds() < 15 * 60
+    except Exception:
+        return False
+
+
+def _mark_auto_report_state(send_key: str, status: str, message: str, current_cycle: str = None):
+    """记录自动日报发送结果"""
+    with AUTO_REPORT_LOCK:
+        state = _load_auto_report_state()
+        state[send_key] = {
+            "status": status,
+            "message": message,
+            "current_cycle": current_cycle,
+            "updated_at": get_local_now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        _save_auto_report_state(state)
+
+
+def try_send_auto_daily_report(now: datetime = None):
+    """
+    到达周一/周五 19 点时自动发送生产日报
+    """
+    now = now or get_local_now()
+
+    if now.weekday() not in AUTO_REPORT_WEEKDAYS or now.hour != AUTO_REPORT_HOUR:
+        return False, "未到自动发送时间"
+
+    send_key = now.strftime("%Y-%m-%d")
+
+    with AUTO_REPORT_LOCK:
+        state = _load_auto_report_state()
+        state_item = state.get(send_key, {})
+        if state_item.get("status") == "success":
+            return False, "今日自动日报已发送"
+        if _is_recent_auto_report_sending(state_item, now):
+            return False, "自动日报正在发送中"
+
+        state[send_key] = {
+            "status": "sending",
+            "message": "自动日报发送中",
+            "current_cycle": None,
+            "updated_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        _save_auto_report_state(state)
+
+    try:
+        df = fetch_all_systems_data_for_auto_report()
+        if df.empty:
+            msg = "自动日报发送失败: 未获取到生产数据"
+            _mark_auto_report_state(send_key, "failed", msg)
+            print(msg)
+            return True, msg
+
+        current_cycle = get_current_cycle()
+        success, msg = send_daily_report_to_group(df, current_cycle)
+        status = "success" if success else "failed"
+        _mark_auto_report_state(send_key, status, msg, current_cycle)
+        print(f"自动日报发送结果: {msg}")
+        return True, msg
+
+    except Exception as e:
+        msg = f"自动日报发送异常: {e}"
+        _mark_auto_report_state(send_key, "failed", msg)
+        print(msg)
+        return True, msg
+
+
+def _auto_daily_report_scheduler_loop():
+    """自动日报后台调度循环"""
+    print("自动生产日报定时器已启动：周一/周五 19:00 发送")
+    while True:
+        try:
+            try_send_auto_daily_report()
+        except Exception as e:
+            print(f"自动日报定时器异常: {e}")
+
+        time.sleep(AUTO_REPORT_CHECK_INTERVAL_SECONDS)
+
+
+@st.cache_resource(show_spinner=False)
+def start_auto_daily_report_scheduler():
+    """启动自动日报后台线程，Streamlit 进程内只启动一次"""
+    thread = threading.Thread(
+        target=_auto_daily_report_scheduler_loop,
+        name="auto-daily-report-scheduler",
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
+
 def render_overview_tab(df: pd.DataFrame):
     """渲染概览标签页（生产进度大盘 + 失败分析）"""
     st.header("📊 生产进度大盘")
@@ -382,13 +1145,12 @@ def render_overview_tab(df: pd.DataFrame):
     processing_bgm_count = len(df[df["生产状态"] == "处理BGM"])
     not_completed_count = not_started_count + recognition_done_count + processing_bgm_count
 
-    # 失败细分：识别失败、BGM失败、其他
+    # 失败细分：识别失败、BGM失败、失败处理中
     recognize_fail_count = len(df[df["生产状态"] == "失败"])
     bgm_fail_count = len(df[df["生产状态"] == "处理BGM失败"])
-    # 其他失败状态
-    fail_statuses = ["失败", "处理BGM失败", "失败处理中"]
-    other_fail_count = len(df[df["生产状态"].isin(fail_statuses)]) - recognize_fail_count - bgm_fail_count
-    total_fail_count = recognize_fail_count + bgm_fail_count + max(0, other_fail_count)
+    handling_fail_count = len(df[df["生产状态"] == "失败处理中"])
+    # 真正需要关注的失败（不含正在处理的）
+    total_fail_count = recognize_fail_count + bgm_fail_count
 
     with col1:
         st.markdown(create_kpi_card("总剧数", total_count, color="#5470c6"), unsafe_allow_html=True)
@@ -421,14 +1183,171 @@ def render_overview_tab(df: pd.DataFrame):
     with col_center:
         st.markdown(create_kpi_card("BGM失败", bgm_fail_count, color="#e74c3c"), unsafe_allow_html=True)
     with col_right:
-        st.markdown(create_kpi_card("其他失败", max(0, other_fail_count), color="#9a60b4"), unsafe_allow_html=True)
+        st.markdown(create_kpi_card("失败处理中", handling_fail_count, color="#3498db"), unsafe_allow_html=True)
 
-    # 如果有其他失败状态，显示警告
-    if other_fail_count > 0:
-        other_statuses = df[df["生产状态"].isin(["失败", "处理BGM失败"])] == False
-        unique_other_statuses = df[~df["生产状态"].isin(["完成", "识别完成", "合并视频", "识别字幕", "识别角色", "处理BGM", "未开始", "失败", "处理BGM失败", "失败处理中"])]["生产状态"].unique().tolist()
-        if unique_other_statuses:
-            st.caption(f"⚠️ 其他失败状态: {unique_other_statuses}")
+    # 如果有未知状态，显示警告
+    known_statuses = ["完成", "识别完成", "合并视频", "识别字幕", "识别角色", "处理BGM", "未开始", "失败", "处理BGM失败", "失败处理中"]
+    unknown_statuses = df[~df["生产状态"].isin(known_statuses)]["生产状态"].unique().tolist()
+    if unknown_statuses:
+        st.caption(f"⚠️ 未知状态: {unknown_statuses}")
+
+    st.markdown("---")
+
+    # ===== 识别角色耗时指标 =====
+    st.subheader("⏱️ 识别角色耗时分析")
+
+    # 计算平均识别角色耗时
+    recognition_time_stats = calculate_avg_recognition_time(df)
+    cycle_recognition_stats = calculate_cycle_recognition_time(df)
+
+    # 第一行：总体平均识别角色耗时
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        # 显示总体平均识别角色耗时卡片
+        if recognition_time_stats["avg_recognition_time"] is not None:
+            avg_time_str = f"{recognition_time_stats['avg_recognition_time']:.1f}h"
+            st.markdown(
+                create_kpi_card(
+                    "平均识别角色耗时",
+                    avg_time_str,
+                    color="#73c0de"
+                ),
+                unsafe_allow_html=True
+            )
+            st.caption(f"📊 基于 {recognition_time_stats['valid_count']} 条有效记录")
+        else:
+            st.markdown(
+                create_kpi_card("平均识别角色耗时", "暂无数据", color="#73c0de"),
+                unsafe_allow_html=True
+            )
+
+    with col2:
+        # 显示识别时无报错的平均耗时
+        if recognition_time_stats["avg_time_no_error"] is not None:
+            avg_time_str = f"{recognition_time_stats['avg_time_no_error']:.1f}h"
+            st.markdown(
+                create_kpi_card(
+                    "识别时无报错",
+                    avg_time_str,
+                    color="#91cc75"
+                ),
+                unsafe_allow_html=True
+            )
+            st.caption(f"📊 {recognition_time_stats['count_no_error']} 条记录")
+        else:
+            st.markdown(
+                create_kpi_card("识别时无报错", "暂无数据", color="#91cc75"),
+                unsafe_allow_html=True
+            )
+
+    with col3:
+        # 显示识别时有报错的平均耗时
+        if recognition_time_stats["avg_time_with_error"] is not None:
+            avg_time_str = f"{recognition_time_stats['avg_time_with_error']:.1f}h"
+            st.markdown(
+                create_kpi_card(
+                    "识别时有报错",
+                    avg_time_str,
+                    color="#ee6666"
+                ),
+                unsafe_allow_html=True
+            )
+            st.caption(f"📊 {recognition_time_stats['count_with_error']} 条记录")
+        else:
+            st.markdown(
+                create_kpi_card("识别时有报错", "暂无数据", color="#ee6666"),
+                unsafe_allow_html=True
+            )
+
+    st.caption("📋 筛选条件：开始生产时间、识别角色结束时间均不为空 | 无报错：失败类型为空 | 有报错：失败类型不为空")
+
+    # 第二行：失败类型占比饼图（仅显示有报错的记录）
+    error_type_distribution = recognition_time_stats.get("error_type_distribution", {})
+    if error_type_distribution:
+        st.markdown("**📊 失败类型分布（仅统计识别时有报错的记录）**")
+
+        # 准备饼图数据
+        data_pair = [(error_type, count) for error_type, count in error_type_distribution.items()]
+        # 按数量降序排序
+        data_pair.sort(key=lambda x: x[1], reverse=True)
+
+        # 计算总数用于显示百分比
+        total_errors = sum(error_type_distribution.values())
+
+        pie = (
+            Pie(init_opts=opts.InitOpts(width="100%", height="400px", theme="light"))
+            .add(
+                series_name="失败类型",
+                data_pair=data_pair,
+                radius=["30%", "60%"],
+                label_opts=opts.LabelOpts(
+                    formatter=JsCode("""
+                        function(params) {
+                            var percent = (params.value / """ + str(total_errors) + """ * 100).toFixed(1);
+                            return params.name + ': ' + params.value + ' (' + percent + '%)';
+                        }
+                    """)
+                ),
+                itemstyle_opts=opts.ItemStyleOpts(
+                    border_width=2,
+                    border_color="#fff"
+                ),
+            )
+            .set_global_opts(
+                title_opts=opts.TitleOpts(title=""),
+                legend_opts=opts.LegendOpts(pos_left="left", pos_top="middle", type_="scroll"),
+                tooltip_opts=opts.TooltipOpts(
+                    trigger="item",
+                    formatter="{b}: {c} ({d}%)"
+                ),
+            )
+        )
+        render_pyecharts(pie)
+    else:
+        if recognition_time_stats["count_with_error"] == 0:
+            st.success("✅ 所有识别记录均无报错")
+
+    # 第三行：各周期识别角色耗时折线图
+    if not cycle_recognition_stats.empty:
+        cycles = cycle_recognition_stats["生产周期"].tolist()
+        avg_times = cycle_recognition_stats["平均识别角色耗时"].tolist()
+        counts = cycle_recognition_stats["记录数"].tolist()
+
+        line = (
+            Line(init_opts=opts.InitOpts(width="100%", height="300px", theme="light"))
+            .add_xaxis(cycles)
+            .add_yaxis(
+                series_name="平均识别角色耗时",
+                y_axis=[round(t, 1) for t in avg_times],
+                symbol="circle",
+                symbol_size=8,
+                linestyle_opts=opts.LineStyleOpts(width=2, color="#73c0de"),
+                itemstyle_opts=opts.ItemStyleOpts(color="#73c0de"),
+                label_opts=opts.LabelOpts(is_show=True, position="top", formatter="{c}h"),
+            )
+            .set_global_opts(
+                title_opts=opts.TitleOpts(title="各生产周期识别角色耗时变化"),
+                xaxis_opts=opts.AxisOpts(axislabel_opts=opts.LabelOpts(rotate=30)),
+                yaxis_opts=opts.AxisOpts(name="小时"),
+                tooltip_opts=opts.TooltipOpts(
+                    trigger="axis",
+                    formatter=JsCode("""
+                        function(params) {
+                            var cycle = params[0].axisValue;
+                            var time = params[0].value;
+                            var idx = params[0].dataIndex;
+                            var count = """ + str(counts) + """[idx];
+                            return '周期: ' + cycle + '<br/>平均耗时: ' + time + 'h<br/>记录数: ' + count;
+                        }
+                    """)
+                ),
+                legend_opts=opts.LegendOpts(pos_top="top"),
+            )
+        )
+        render_pyecharts(line)
+    else:
+        st.info("暂无各周期识别角色耗时数据")
 
     st.markdown("---")
 
@@ -438,6 +1357,8 @@ def render_overview_tab(df: pd.DataFrame):
     # 计算平均生产总耗时
     prod_time_stats = calculate_avg_production_time(df)
     cycle_time_stats = calculate_cycle_production_time(df)
+    weekday_cycle_time_stats = calculate_cycle_weekday_production_time(df)
+    cycle_completion_stats = calculate_cycle_completion_rate(df)
 
     col_left, col_right = st.columns(2)
 
@@ -503,6 +1424,134 @@ def render_overview_tab(df: pd.DataFrame):
             render_pyecharts(line)
         else:
             st.info("暂无各周期生产总耗时数据")
+
+    st.markdown("---")
+
+    # ===== 周一/周五生产总耗时对比 =====
+    st.subheader("📈 周一/周五生产总耗时对比")
+    st.caption("📋 按入表时间窗口统计：周一线=上个周五至本周一，周五线=上个周五至本周五；筛选条件与平均生产总耗时一致")
+
+    if not weekday_cycle_time_stats.empty:
+        cycles = weekday_cycle_time_stats["生产周期"].tolist()
+        monday_times = [
+            round(t, 1) if pd.notna(t) else None
+            for t in weekday_cycle_time_stats["周一平均生产总耗时"].tolist()
+        ]
+        friday_times = [
+            round(t, 1) if pd.notna(t) else None
+            for t in weekday_cycle_time_stats["周五平均生产总耗时"].tolist()
+        ]
+        monday_counts = weekday_cycle_time_stats["周一记录数"].tolist()
+        friday_counts = weekday_cycle_time_stats["周五记录数"].tolist()
+        monday_ranges = weekday_cycle_time_stats["周一统计范围"].tolist()
+        friday_ranges = weekday_cycle_time_stats["周五统计范围"].tolist()
+
+        line = (
+            Line(init_opts=opts.InitOpts(width="100%", height="380px", theme="light"))
+            .add_xaxis(cycles)
+            .add_yaxis(
+                series_name="周一窗口平均生产总耗时",
+                y_axis=monday_times,
+                symbol="circle",
+                symbol_size=8,
+                linestyle_opts=opts.LineStyleOpts(width=2, color="#5470c6"),
+                itemstyle_opts=opts.ItemStyleOpts(color="#5470c6"),
+                label_opts=opts.LabelOpts(is_show=False),
+            )
+            .add_yaxis(
+                series_name="周五窗口平均生产总耗时",
+                y_axis=friday_times,
+                symbol="diamond",
+                symbol_size=8,
+                linestyle_opts=opts.LineStyleOpts(width=2, color="#fc8452"),
+                itemstyle_opts=opts.ItemStyleOpts(color="#fc8452"),
+                label_opts=opts.LabelOpts(is_show=False),
+            )
+            .set_global_opts(
+                title_opts=opts.TitleOpts(title=""),
+                xaxis_opts=opts.AxisOpts(axislabel_opts=opts.LabelOpts(rotate=30)),
+                yaxis_opts=opts.AxisOpts(name="小时"),
+                tooltip_opts=opts.TooltipOpts(
+                    trigger="axis",
+                    formatter=JsCode("""
+                        function(params) {
+                            var mondayCounts = """ + str(monday_counts) + """;
+                            var fridayCounts = """ + str(friday_counts) + """;
+                            var mondayRanges = """ + str(monday_ranges) + """;
+                            var fridayRanges = """ + str(friday_ranges) + """;
+                            var idx = params[0].dataIndex;
+                            var html = '周期: ' + params[0].axisValue;
+                            params.forEach(function(item) {
+                                var count = item.seriesName.indexOf('周一') >= 0 ? mondayCounts[idx] : fridayCounts[idx];
+                                var range = item.seriesName.indexOf('周一') >= 0 ? mondayRanges[idx] : fridayRanges[idx];
+                                var value = (item.value === null || item.value === undefined) ? '暂无' : item.value + 'h';
+                                html += '<br/>' + item.marker + item.seriesName + ': ' + value + '（' + count + '条，' + range + '）';
+                            });
+                            return html;
+                        }
+                    """)
+                ),
+                legend_opts=opts.LegendOpts(pos_top="top"),
+            )
+        )
+        render_pyecharts(line)
+    else:
+        st.info("暂无周一/周五生产总耗时数据")
+
+    st.markdown("---")
+
+    # ===== 各生产周期完成率 =====
+    st.subheader("📊 各生产周期完成率")
+
+    if not cycle_completion_stats.empty:
+        cycles = cycle_completion_stats["生产周期"].tolist()
+        rates = [round(rate, 1) for rate in cycle_completion_stats["完成率"].tolist()]
+        total_counts = cycle_completion_stats["总数"].tolist()
+        completed_counts = cycle_completion_stats["已完成"].tolist()
+
+        bar = (
+            Bar(init_opts=opts.InitOpts(width="100%", height="380px", theme="light"))
+            .add_xaxis(cycles)
+            .add_yaxis(
+                series_name="完成率",
+                y_axis=rates,
+                label_opts=opts.LabelOpts(position="top", formatter="{c}%"),
+                itemstyle_opts=opts.ItemStyleOpts(
+                    color=JsCode("""
+                        function(params) {
+                            var value = params.value;
+                            if (value >= 80) return '#91cc75';
+                            if (value >= 50) return '#fac858';
+                            return '#ee6666';
+                        }
+                    """)
+                ),
+            )
+            .set_global_opts(
+                title_opts=opts.TitleOpts(title=""),
+                xaxis_opts=opts.AxisOpts(axislabel_opts=opts.LabelOpts(rotate=30)),
+                yaxis_opts=opts.AxisOpts(name="完成率 (%)", min_=0, max_=100),
+                tooltip_opts=opts.TooltipOpts(
+                    trigger="axis",
+                    axis_pointer_type="shadow",
+                    formatter=JsCode("""
+                        function(params) {
+                            var totalCounts = """ + str(total_counts) + """;
+                            var completedCounts = """ + str(completed_counts) + """;
+                            var idx = params[0].dataIndex;
+                            return '周期: ' + params[0].axisValue +
+                                '<br/>完成率: ' + params[0].value + '%' +
+                                '<br/>已完成: ' + completedCounts[idx] +
+                                '<br/>总数: ' + totalCounts[idx];
+                        }
+                    """)
+                ),
+                legend_opts=opts.LegendOpts(pos_top="top"),
+            )
+        )
+        render_pyecharts(bar)
+    else:
+        st.info("暂无各生产周期完成率数据")
 
     st.markdown("---")
 
@@ -704,7 +1753,7 @@ def render_realtime_monitor_tab(df: pd.DataFrame):
         return
 
     # 计算已处理时长和预估完成时长
-    now = datetime.now()
+    now = get_local_now()
     active_df = active_df.copy()
 
     active_df["已处理时长"] = active_df["开始生产时间"].apply(
@@ -782,7 +1831,7 @@ def render_today_input_tab(df: pd.DataFrame):
         st.warning("暂无数据")
         return
 
-    today = datetime.now().date()
+    today = get_local_now().date()
 
     # ===== 系统筛选器 =====
     st.subheader("🔍 系统筛选")
@@ -1000,7 +2049,7 @@ def get_current_cycle() -> str:
     - 今天是周一到周四：当前周期 = 本周五
     - 今天是周五到周日：当前周期 = 今天（周五）
     """
-    today = datetime.now()
+    today = get_local_now()
 
     # 计算本周五（weekday=4 代表周五）
     days_until_friday = (4 - today.weekday()) % 7
@@ -1023,9 +2072,33 @@ def get_last_cycle() -> str:
     return last_friday.strftime("%Y%m%d")
 
 
+def get_recent_cycles(count: int = 4) -> list:
+    """获取最近 count 个生产周期（含当前周期）"""
+    current_date = datetime.strptime(get_current_cycle(), "%Y%m%d")
+    return [
+        (current_date - timedelta(days=7 * index)).strftime("%Y%m%d")
+        for index in range(count)
+    ]
+
+
+def format_recent_cycle_option(cycle: str) -> str:
+    """格式化最近周期快捷选项"""
+    if not cycle:
+        return "不使用快捷选择"
+
+    recent_cycles = get_recent_cycles()
+    if cycle in recent_cycles:
+        index = recent_cycles.index(cycle)
+        if index == 0:
+            return f"{cycle}（当前周期）"
+        return f"{cycle}（上{index}周期）"
+
+    return cycle
+
+
 def is_monday_10am() -> bool:
     """判断是否是周一早上10点左右"""
-    now = datetime.now()
+    now = get_local_now()
     return now.weekday() == 0 and 9 <= now.hour <= 11
 
 
@@ -1037,7 +2110,7 @@ def render_daily_report_tab(df: pd.DataFrame):
         st.warning("暂无数据")
         return
 
-    now = datetime.now()
+    now = get_local_now()
     today = now.date()
 
     # ===== 周期信息 =====
@@ -1051,6 +2124,47 @@ def render_daily_report_tab(df: pd.DataFrame):
         <p style="margin: 5px 0; color: #666;">报告生成时间: <b>{now.strftime('%Y-%m-%d %H:%M:%S')}</b></p>
     </div>
     """, unsafe_allow_html=True)
+
+    # ===== 发送日报按钮 =====
+    st.subheader("📤 发送日报")
+
+    # 使用 session_state 保存状态
+    if "show_preview" not in st.session_state:
+        st.session_state.show_preview = False
+    if "preview_content" not in st.session_state:
+        st.session_state.preview_content = ""
+
+    # 预览按钮
+    if st.button("👁️ 预览日报内容", key="preview_daily_report_btn"):
+        st.session_state.show_preview = True
+        st.session_state.preview_content = build_daily_report_message(df, current_cycle)
+
+    # 显示预览内容
+    if st.session_state.show_preview and st.session_state.preview_content:
+        st.markdown("---")
+        st.subheader("📋 预览内容（可编辑）")
+        st.caption("💡 可以直接在下方文本框中修改内容，修改后点击确认发送")
+        edited_content = st.text_area("日报内容", st.session_state.preview_content, height=400, key="preview_text_area")
+
+        col_confirm, col_cancel = st.columns(2)
+        with col_confirm:
+            if st.button("✅ 确认发送", key="confirm_send_btn"):
+                with st.spinner("正在发送日报..."):
+                    # 使用编辑后的内容发送
+                    success, msg = send_custom_report_to_group(edited_content)
+                    if success:
+                        st.success(msg)
+                        st.session_state.show_preview = False
+                        st.session_state.preview_content = ""
+                    else:
+                        st.error(msg)
+        with col_cancel:
+            if st.button("❌ 取消", key="cancel_send_btn"):
+                st.session_state.show_preview = False
+                st.session_state.preview_content = ""
+                st.rerun()
+
+    st.markdown("---")
 
     # ===== 第一部分：上周期生产情况（简化版） =====
     st.subheader("📆 上周期生产情况")
@@ -1108,6 +2222,96 @@ def render_daily_report_tab(df: pd.DataFrame):
 
     st.markdown("---")
 
+    # ===== 失败类型分析 =====
+    st.subheader("📈 失败类型分析")
+
+    # 获取所有周期
+    all_cycles = df["生产周期"].dropna().unique().tolist()
+    all_cycles = sorted([c for c in all_cycles if c])
+
+    if all_cycles:
+        # 统计每个周期的失败类型
+        cycle_fail_stats = []
+
+        for cycle in all_cycles:
+            cycle_df = df[df["生产周期"] == cycle]
+            # 筛选失败记录
+            cycle_failed = cycle_df[cycle_df["生产状态"].isin(["失败", "处理BGM失败"])]
+
+            if cycle_failed.empty:
+                continue
+
+            # 统计失败类型
+            fail_type_counts = cycle_failed["失败类型"].value_counts()
+
+            total_fail = len(cycle_failed)
+            top_fail_type = fail_type_counts.index[0] if len(fail_type_counts) > 0 else "未知"
+            top_fail_count = fail_type_counts.iloc[0] if len(fail_type_counts) > 0 else 0
+            top_fail_rate = (top_fail_count / total_fail * 100) if total_fail > 0 else 0
+
+            cycle_fail_stats.append({
+                "周期": cycle,
+                "失败总数": total_fail,
+                "主要失败类型": f"{top_fail_type} ({top_fail_count}部, {top_fail_rate:.1f}%)",
+                "失败类型分布": fail_type_counts.to_dict()
+            })
+
+        if cycle_fail_stats:
+            # 显示表格
+            fail_stats_df = pd.DataFrame(cycle_fail_stats)
+            display_df = fail_stats_df[["周期", "失败总数", "主要失败类型"]].copy()
+            st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+            # 绘制失败类型趋势图
+            st.markdown("**各周期失败类型分布**")
+
+            # 获取所有失败类型
+            all_fail_types = set()
+            for stat in cycle_fail_stats:
+                all_fail_types.update(stat["失败类型分布"].keys())
+            all_fail_types = sorted([t for t in all_fail_types if t])
+
+            # 构建每个失败类型的趋势数据
+            cycles_list = [s["周期"] for s in cycle_fail_stats]
+
+            # 使用堆叠柱状图
+            bar = Bar(init_opts=opts.InitOpts(width="100%", height="400px", theme="light"))
+            bar.add_xaxis(cycles_list)
+
+            # 预定义颜色列表
+            colors = ["#ee6666", "#fac858", "#73c0de", "#9a60b4", "#fc8452", "#3ba272", "#5470c6", "#91cc75"]
+
+            # 为每种失败类型添加数据
+            for idx, fail_type in enumerate(all_fail_types):
+                values = []
+                for stat in cycle_fail_stats:
+                    values.append(stat["失败类型分布"].get(fail_type, 0))
+
+                color = colors[idx % len(colors)]
+                bar.add_yaxis(
+                    series_name=fail_type,
+                    y_axis=values,
+                    stack="总量",
+                    label_opts=opts.LabelOpts(is_show=False),
+                    itemstyle_opts=opts.ItemStyleOpts(color=color),
+                )
+
+            bar.set_global_opts(
+                title_opts=opts.TitleOpts(title=""),
+                xaxis_opts=opts.AxisOpts(axislabel_opts=opts.LabelOpts(rotate=30)),
+                yaxis_opts=opts.AxisOpts(name="失败数"),
+                tooltip_opts=opts.TooltipOpts(trigger="axis", axis_pointer_type="shadow"),
+                legend_opts=opts.LegendOpts(pos_top="top", type_="scroll"),
+            )
+            render_pyecharts(bar)
+
+        else:
+            st.info("各周期无失败记录")
+    else:
+        st.info("暂无周期数据")
+
+    st.markdown("---")
+
     # ===== 第三部分：失败记录与异常记录（合并展示） =====
     st.subheader("⚠️ 失败记录与异常记录")
     st.caption("📋 按系统 > 生产周期（越早越靠前）展示失败和整备异常记录")
@@ -1126,7 +2330,7 @@ def render_daily_report_tab(df: pd.DataFrame):
             days = hours / 24
             return f"{days:.1f}天"
 
-    # 1. 失败记录
+    # 1. 失败记录（未处理的失败）
     failed_df = df[df["生产状态"].isin(["失败", "处理BGM失败"])].copy()
     if not failed_df.empty:
         for _, row in failed_df.iterrows():
@@ -1152,7 +2356,33 @@ def render_daily_report_tab(df: pd.DataFrame):
                 "遗留小时": pending_hours if pd.notna(entry_time) else 999999,
             })
 
-    # 2. 整备异常记录（未开始且整备状态或NAS位置为空）
+    # 2. 失败处理中记录（正在处理的失败）
+    handling_df = df[df["生产状态"] == "失败处理中"].copy()
+    if not handling_df.empty:
+        for _, row in handling_df.iterrows():
+            # 计算遗留时长
+            entry_time = row.get("入表时间")
+            if pd.notna(entry_time):
+                pending_hours = (now - entry_time).total_seconds() / 3600
+                pending_str = format_pending_hours(pending_hours)
+            else:
+                pending_str = "-"
+                pending_hours = 999999
+
+            issue_records.append({
+                "系统": row.get("系统"),
+                "生产周期": row.get("生产周期", ""),
+                "剧名": row.get("剧名"),
+                "问题类型": "失败处理中",
+                "失败类型": row.get("失败类型") or "-",
+                "异常原因": "正在处理",
+                "备注": row.get("备注", ""),
+                "入表时间": entry_time,
+                "遗留时长": pending_str,
+                "遗留小时": pending_hours if pd.notna(entry_time) else 999999,
+            })
+
+    # 3. 整备异常记录（未开始且整备状态或NAS位置为空）
     not_started_df = df[df["生产状态"] == "未开始"].copy()
     if not not_started_df.empty:
         abnormal_df = not_started_df[
@@ -1218,13 +2448,16 @@ def render_daily_report_tab(df: pd.DataFrame):
                 if cycle_issues.empty:
                     continue
 
-                # 统计失败和异常数量
+                # 统计各类问题数量
                 fail_count = len(cycle_issues[cycle_issues["问题类型"] == "失败"])
+                handling_count = len(cycle_issues[cycle_issues["问题类型"] == "失败处理中"])
                 abnormal_count = len(cycle_issues[cycle_issues["问题类型"] == "整备异常"])
 
                 cycle_info = f"📅 周期 {cycle_label}"
                 if fail_count > 0:
                     cycle_info += f" | 失败 {fail_count}条"
+                if handling_count > 0:
+                    cycle_info += f" | 失败处理中 {handling_count}条"
                 if abnormal_count > 0:
                     cycle_info += f" | 异常 {abnormal_count}条"
 
@@ -1235,12 +2468,15 @@ def render_daily_report_tab(df: pd.DataFrame):
                 display_df = display_df.sort_values("遗留小时", ascending=False)
                 display_df = display_df.drop(columns=["遗留小时"])
 
-                # 高亮显示
+                # 高亮显示：失败=红色，失败处理中=蓝色，整备异常=黄色
                 def highlight_row(row):
-                    if row["问题类型"] == "失败":
-                        return ["background-color: #ffebee"] * len(row)
+                    problem_type = row["问题类型"]
+                    if problem_type == "失败":
+                        return ["background-color: #ffebee"] * len(row)  # 红色
+                    elif problem_type == "失败处理中":
+                        return ["background-color: #e3f2fd"] * len(row)  # 蓝色
                     else:
-                        return ["background-color: #fff8e1"] * len(row)
+                        return ["background-color: #fff8e1"] * len(row)  # 黄色
 
                 styled_df = display_df.style.apply(highlight_row, axis=1)
                 st.dataframe(styled_df, use_container_width=True, hide_index=True)
@@ -1278,8 +2514,11 @@ def render_daily_report_tab(df: pd.DataFrame):
             (system_df["识别角色结束时间"].apply(lambda x: x.date() if pd.notna(x) else None) == today)
         ])
 
-        # 失败+异常总数
+        # 失败记录（未处理）
         failed_count = len(system_df[system_df["生产状态"].isin(["失败", "处理BGM失败"])])
+        # 失败处理中记录
+        handling_count = len(system_df[system_df["生产状态"] == "失败处理中"])
+        # 整备异常记录
         not_started = system_df[system_df["生产状态"] == "未开始"]
         abnormal_count = len(not_started[
             (not_started["整备状态"].isna() | (not_started["整备状态"] == "")) |
@@ -1291,7 +2530,9 @@ def render_daily_report_tab(df: pd.DataFrame):
             "今日新增": today_new,
             "剩余待处理": pending,
             "今日完成": today_completed,
-            "失败+异常": failed_count + abnormal_count,
+            "失败": failed_count,
+            "失败处理中": handling_count,
+            "整备异常": abnormal_count,
         })
 
     if summary_data:
@@ -1305,7 +2546,7 @@ def render_daily_report_tab(df: pd.DataFrame):
 
         styled_df = summary_df.style.applymap(
             highlight_issues,
-            subset=['失败+异常']
+            subset=['失败', '失败处理中', '整备异常']
         )
 
         st.dataframe(styled_df, use_container_width=True, hide_index=True)
@@ -1320,6 +2561,446 @@ def render_daily_report_tab(df: pd.DataFrame):
         )
 
 
+def render_dubbing_tab(production_df: pd.DataFrame):
+    """渲染配音情况统计标签页"""
+    st.header("🎤 配音情况统计")
+
+    # 提示用户数据范围
+    st.info("📌 为提升加载速度，配音数据仅显示最近四个生产周期的记录")
+
+    if production_df.empty:
+        st.warning("暂无数据")
+        return
+
+    # ===== 周期筛选 =====
+    st.subheader("📅 周期筛选")
+
+    # 获取所有周期
+    all_cycles = production_df["当前制作周期"].dropna().unique().tolist()
+    all_cycles = sorted([c for c in all_cycles if c], reverse=True)  # 按周期降序
+
+    # 周期选择器
+    selected_cycle = st.selectbox(
+        "选择制作周期",
+        options=["全部周期"] + all_cycles,
+        key="dubbing_cycle_filter"
+    )
+
+    # 根据选择筛选数据
+    if selected_cycle == "全部周期":
+        df_filtered = production_df
+    else:
+        df_filtered = production_df[production_df["当前制作周期"] == selected_cycle]
+
+    # 配音完成定义：当前状态 = 已完成 或 待检查者确认
+    completed_statuses = ["已完成", "待检查者确认"]
+    # 待配音定义：当前状态 = 失败 或 未开始
+    pending_statuses = ["失败", "未开始"]
+    # 用于存储未完成周期
+    incomplete_cycles = []
+
+    st.markdown("---")
+
+    # ===== 总体概览 =====
+    st.subheader("📊 总体概览")
+
+    total_count = len(df_filtered)
+    dubbing_completed = len(df_filtered[df_filtered["当前状态"].isin(completed_statuses)])
+    dubbing_pending = len(df_filtered[df_filtered["当前状态"].isin(pending_statuses)])
+    dubbing_other = total_count - dubbing_completed - dubbing_pending  # 其他状态
+    completion_rate = (dubbing_completed / total_count * 100) if total_count > 0 else 0
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.markdown(create_kpi_card("总记录数", total_count, color="#5470c6"), unsafe_allow_html=True)
+    with col2:
+        st.markdown(create_kpi_card("配音完成", dubbing_completed, color="#91cc75"), unsafe_allow_html=True)
+    with col3:
+        st.markdown(create_kpi_card("待配音", dubbing_pending, color="#fac858"), unsafe_allow_html=True)
+    with col4:
+        st.markdown(create_kpi_card("完成率", f"{completion_rate:.1f}%", color="#73c0de"), unsafe_allow_html=True)
+
+    # 显示各状态分布
+    if dubbing_other > 0:
+        st.caption(f"📋 其他状态记录: {dubbing_other}条（非配音完成也非待配音）")
+
+    st.markdown("---")
+
+    # ===== 制作耗时统计 =====
+    st.subheader("⏱️ 制作耗时统计")
+
+    # 计算制作耗时
+    dubbing_time_stats = calculate_dubbing_production_time(df_filtered)
+
+    col_left, col_right = st.columns(2)
+
+    with col_left:
+        # 显示平均制作耗时卡片
+        if dubbing_time_stats["avg_time"] is not None:
+            avg_time_str = f"{dubbing_time_stats['avg_time']:.1f}h"
+            st.markdown(
+                create_kpi_card(
+                    "平均制作耗时",
+                    avg_time_str,
+                    color="#9a60b4"
+                ),
+                unsafe_allow_html=True
+            )
+            st.caption(f"📊 基于 {dubbing_time_stats['valid_count']} 条有效记录统计")
+            st.caption("📋 筛选条件：制作耗时小时不为空且不为0")
+        else:
+            st.markdown(
+                create_kpi_card("平均制作耗时", "暂无数据", color="#9a60b4"),
+                unsafe_allow_html=True
+            )
+            st.caption("📋 需要有制作耗时小时字段的有效数据")
+
+    with col_right:
+        # 显示各周期制作耗时折线图
+        if not dubbing_time_stats["cycle_stats"].empty:
+            cycle_stats_df = dubbing_time_stats["cycle_stats"]
+            cycles = cycle_stats_df["当前制作周期"].tolist()
+            avg_times = cycle_stats_df["平均制作耗时"].tolist()
+            counts = cycle_stats_df["记录数"].tolist()
+
+            line = (
+                Line(init_opts=opts.InitOpts(width="100%", height="300px", theme="light"))
+                .add_xaxis(cycles)
+                .add_yaxis(
+                    series_name="平均制作耗时",
+                    y_axis=[round(t, 1) for t in avg_times],
+                    symbol="circle",
+                    symbol_size=8,
+                    linestyle_opts=opts.LineStyleOpts(width=2, color="#9a60b4"),
+                    itemstyle_opts=opts.ItemStyleOpts(color="#9a60b4"),
+                    label_opts=opts.LabelOpts(is_show=True, position="top", formatter="{c}h"),
+                )
+                .set_global_opts(
+                    title_opts=opts.TitleOpts(title="各周期平均制作耗时"),
+                    xaxis_opts=opts.AxisOpts(axislabel_opts=opts.LabelOpts(rotate=30)),
+                    yaxis_opts=opts.AxisOpts(name="小时"),
+                    tooltip_opts=opts.TooltipOpts(
+                        trigger="axis",
+                        formatter=JsCode("""
+                            function(params) {
+                                var cycle = params[0].axisValue;
+                                var time = params[0].value;
+                                var idx = params[0].dataIndex;
+                                var count = """ + str(counts) + """[idx];
+                                return '周期: ' + cycle + '<br/>平均耗时: ' + time + 'h<br/>记录数: ' + count;
+                            }
+                        """)
+                    ),
+                    legend_opts=opts.LegendOpts(pos_top="top"),
+                )
+            )
+            render_pyecharts(line)
+        else:
+            st.info("暂无各周期制作耗时数据")
+
+    st.markdown("---")
+
+    # ===== 各系统各周期制作耗时 =====
+    if not dubbing_time_stats["system_cycle_stats"].empty:
+        st.subheader("📊 各系统各周期制作耗时")
+
+        system_cycle_df = dubbing_time_stats["system_cycle_stats"]
+
+        # 数据透视表：行为周期，列为系统
+        pivot_df = system_cycle_df.pivot_table(
+            index="当前制作周期",
+            columns="系统",
+            values="平均制作耗时",
+            aggfunc="mean"
+        ).reset_index()
+
+        # 显示表格
+        display_df = pivot_df.round(1)
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+        # 绘制各系统折线图
+        systems_in_data = [col for col in pivot_df.columns if col != "当前制作周期"]
+
+        if systems_in_data:
+            line = Line(init_opts=opts.InitOpts(width="100%", height="400px", theme="light"))
+            line.add_xaxis(pivot_df["当前制作周期"].tolist())
+
+            # 定义颜色
+            system_colors = {
+                "众益": "#5470c6", "点众": "#91cc75", "红果": "#ee6666",
+                "掌阅": "#73c0de", "外部制作": "#9a60b4", "ReelShort": "#fc8452"
+            }
+
+            for sys_name in systems_in_data:
+                color = system_colors.get(sys_name, "#999")
+                values = pivot_df[sys_name].tolist()
+                # 替换NaN为None
+                values = [round(v, 1) if pd.notna(v) else None for v in values]
+
+                line.add_yaxis(
+                    series_name=sys_name,
+                    y_axis=values,
+                    symbol="circle",
+                    symbol_size=6,
+                    linestyle_opts=opts.LineStyleOpts(width=2, color=color),
+                    itemstyle_opts=opts.ItemStyleOpts(color=color),
+                    label_opts=opts.LabelOpts(is_show=False),
+                )
+
+            line.set_global_opts(
+                title_opts=opts.TitleOpts(title=""),
+                xaxis_opts=opts.AxisOpts(axislabel_opts=opts.LabelOpts(rotate=30)),
+                yaxis_opts=opts.AxisOpts(name="小时"),
+                tooltip_opts=opts.TooltipOpts(trigger="axis"),
+                legend_opts=opts.LegendOpts(pos_top="top", type_="scroll"),
+            )
+            render_pyecharts(line)
+
+    st.markdown("---")
+
+    # ===== 各系统配音情况 =====
+    st.subheader("🏢 各系统配音情况")
+
+    # 按系统统计
+    system_stats = []
+    for system in SYSTEMS:
+        system_df = df_filtered[df_filtered["系统"] == system]
+        if system_df.empty:
+            continue
+
+        sys_total = len(system_df)
+        sys_completed = len(system_df[system_df["当前状态"].isin(completed_statuses)])
+        sys_pending = len(system_df[system_df["当前状态"].isin(pending_statuses)])
+        sys_rate = (sys_completed / sys_total * 100) if sys_total > 0 else 0
+
+        system_stats.append({
+            "系统": system,
+            "总数": sys_total,
+            "配音完成": sys_completed,
+            "待配音": sys_pending,
+            "完成率": f"{sys_rate:.1f}%"
+        })
+
+    if system_stats:
+        system_stats_df = pd.DataFrame(system_stats)
+
+        # 显示表格
+        st.dataframe(system_stats_df, use_container_width=True, hide_index=True)
+
+        # 绘制堆叠柱状图
+        systems = [s["系统"] for s in system_stats]
+        completed_counts = [s["配音完成"] for s in system_stats]
+        pending_counts = [s["待配音"] for s in system_stats]
+
+        bar = (
+            Bar(init_opts=opts.InitOpts(width="100%", height="400px", theme="light"))
+            .add_xaxis(systems)
+            .add_yaxis(
+                series_name="配音完成",
+                y_axis=completed_counts,
+                stack="总量",
+                label_opts=opts.LabelOpts(is_show=True, position="inside"),
+                itemstyle_opts=opts.ItemStyleOpts(color="#91cc75"),
+            )
+            .add_yaxis(
+                series_name="待配音",
+                y_axis=pending_counts,
+                stack="总量",
+                label_opts=opts.LabelOpts(is_show=True, position="inside"),
+                itemstyle_opts=opts.ItemStyleOpts(color="#fac858"),
+            )
+            .set_global_opts(
+                title_opts=opts.TitleOpts(title=""),
+                xaxis_opts=opts.AxisOpts(axislabel_opts=opts.LabelOpts(rotate=0)),
+                yaxis_opts=opts.AxisOpts(name="剧目数"),
+                tooltip_opts=opts.TooltipOpts(trigger="axis", axis_pointer_type="shadow"),
+                legend_opts=opts.LegendOpts(pos_top="top"),
+            )
+        )
+        render_pyecharts(bar)
+
+    st.markdown("---")
+
+    # ===== 按周期统计配音情况 =====
+    if selected_cycle == "全部周期" and all_cycles:
+        st.subheader("📈 各周期配音完成趋势")
+
+        # 按周期统计
+        cycle_stats = []
+
+        for cycle in sorted(all_cycles):
+            cycle_df = df_filtered[df_filtered["当前制作周期"] == cycle]
+            if cycle_df.empty:
+                continue
+
+            cycle_total = len(cycle_df)
+            cycle_completed = len(cycle_df[cycle_df["当前状态"].isin(completed_statuses)])
+            cycle_pending = len(cycle_df[cycle_df["当前状态"].isin(pending_statuses)])
+            cycle_rate = (cycle_completed / cycle_total * 100) if cycle_total > 0 else 0
+
+            cycle_stats.append({
+                "周期": cycle,
+                "总数": cycle_total,
+                "配音完成": cycle_completed,
+                "待配音": cycle_pending,
+                "完成率": round(cycle_rate, 1)
+            })
+
+            # 记录未完成的周期
+            if cycle_completed < cycle_total:
+                incomplete_cycles.append(cycle)
+
+        if cycle_stats:
+            cycle_stats_df = pd.DataFrame(cycle_stats)
+
+            # 折线图
+            cycles = cycle_stats_df["周期"].tolist()
+            totals = cycle_stats_df["总数"].tolist()
+            completed = cycle_stats_df["配音完成"].tolist()
+            rates = cycle_stats_df["完成率"].tolist()
+
+            line = (
+                Line(init_opts=opts.InitOpts(width="100%", height="400px", theme="light"))
+                .add_xaxis(cycles)
+                .add_yaxis(
+                    series_name="总数",
+                    y_axis=totals,
+                    symbol="circle",
+                    symbol_size=8,
+                    linestyle_opts=opts.LineStyleOpts(width=2, color="#5470c6"),
+                    itemstyle_opts=opts.ItemStyleOpts(color="#5470c6"),
+                    label_opts=opts.LabelOpts(is_show=True, position="top"),
+                )
+                .add_yaxis(
+                    series_name="配音完成",
+                    y_axis=completed,
+                    symbol="diamond",
+                    symbol_size=8,
+                    linestyle_opts=opts.LineStyleOpts(width=2, color="#91cc75"),
+                    itemstyle_opts=opts.ItemStyleOpts(color="#91cc75"),
+                    label_opts=opts.LabelOpts(is_show=True, position="top"),
+                )
+                .set_global_opts(
+                    title_opts=opts.TitleOpts(title=""),
+                    xaxis_opts=opts.AxisOpts(axislabel_opts=opts.LabelOpts(rotate=30)),
+                    yaxis_opts=opts.AxisOpts(name="数量"),
+                    tooltip_opts=opts.TooltipOpts(trigger="axis"),
+                    legend_opts=opts.LegendOpts(pos_top="top"),
+                )
+            )
+            render_pyecharts(line)
+
+            # 显示未完成周期的统计表
+            incomplete_stats = cycle_stats_df[cycle_stats_df["配音完成"] < cycle_stats_df["总数"]]
+            if not incomplete_stats.empty:
+                st.markdown("---")
+                st.subheader("⚠️ 未完成周期统计")
+                st.caption("以下周期的配音完成数不等于总数，需要关注")
+
+                # 高亮显示未完成周期
+                def highlight_incomplete(row):
+                    return ['background-color: #fff3cd' if row['配音完成'] < row['总数'] else '' for _ in row]
+
+                styled_stats = incomplete_stats.style.apply(highlight_incomplete, axis=1)
+                st.dataframe(styled_stats, use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+
+    # ===== 历史周期未完成记录明细 =====
+    if selected_cycle == "全部周期" and incomplete_cycles:
+        st.subheader("🔴 历史周期未完成配音记录")
+        st.caption("以下记录位于历史周期但配音未完成，需要特别关注")
+
+        # 获取所有历史周期（排除当前周期）中未完成的记录
+        current_cycle = get_current_cycle()
+
+        # 筛选历史周期且未完成配音的记录
+        history_incomplete_df = df_filtered[
+            (df_filtered["当前制作周期"].isin(incomplete_cycles)) &
+            (~df_filtered["当前状态"].isin(completed_statuses))
+        ].copy()
+
+        if history_incomplete_df.empty:
+            st.success("✅ 历史周期无未完成记录")
+        else:
+            # 按周期分组展示
+            for cycle in sorted(incomplete_cycles):
+                cycle_incomplete = history_incomplete_df[history_incomplete_df["当前制作周期"] == cycle]
+                if cycle_incomplete.empty:
+                    continue
+
+                # 标记是否为历史周期
+                is_history = cycle < current_cycle
+                cycle_label = f"📅 周期 {cycle}"
+                if is_history:
+                    cycle_label += " ⚠️ 历史周期"
+
+                st.markdown(f"### {cycle_label} ({len(cycle_incomplete)}条)")
+
+                # 按系统分组
+                for system in SYSTEMS:
+                    system_records = cycle_incomplete[cycle_incomplete["系统"] == system]
+                    if system_records.empty:
+                        continue
+
+                    st.markdown(f"**{system}** ({len(system_records)}条)")
+
+                    display_cols = ["剧名", "当前状态", "语言", "制作备注"]
+                    available_cols = [col for col in display_cols if col in system_records.columns]
+                    st.dataframe(
+                        system_records[available_cols],
+                        use_container_width=True,
+                        hide_index=True
+                    )
+
+                st.markdown("")
+
+            # 导出功能
+            csv = history_incomplete_df.to_csv(index=False).encode('utf-8-sig')
+            st.download_button(
+                label="📥 导出历史周期未完成记录(CSV)",
+                data=csv,
+                file_name=f"历史周期未完成配音_{get_local_now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv"
+            )
+
+    st.markdown("---")
+
+    # ===== 待配音明细 =====
+    st.subheader("📋 待配音明细")
+
+    pending_df = df_filtered[df_filtered["当前状态"].isin(pending_statuses)].copy()
+
+    if pending_df.empty:
+        st.success("✅ 当前没有待配音记录")
+    else:
+        # 按系统分组展示
+        for system in SYSTEMS:
+            system_pending = pending_df[pending_df["系统"] == system]
+            if system_pending.empty:
+                continue
+
+            st.markdown(f"### 🏢 {system} ({len(system_pending)}条)")
+
+            display_cols = ["剧名", "当前状态", "当前制作周期", "语言", "制作备注"]
+            available_cols = [col for col in display_cols if col in system_pending.columns]
+            st.dataframe(
+                system_pending[available_cols].sort_values("当前制作周期"),
+                use_container_width=True,
+                hide_index=True
+            )
+            st.markdown("")
+
+        # 导出功能
+        csv = pending_df.to_csv(index=False).encode('utf-8-sig')
+        st.download_button(
+            label="📥 导出待配音明细(CSV)",
+            data=csv,
+            file_name=f"待配音明细_{get_local_now().strftime('%Y%m%d_%H%M%S')}.csv",
+            mime="text/csv"
+        )
+
+
 def main():
     """主函数"""
     st.set_page_config(
@@ -1327,6 +3008,8 @@ def main():
         page_icon="🎬",
         layout="wide"
     )
+
+    start_auto_daily_report_scheduler()
 
     # 自定义 CSS
     st.markdown("""
@@ -1363,15 +3046,24 @@ def main():
     # ===== 侧边栏：周期筛选 =====
     st.sidebar.title("📅 筛选条件")
 
-    # 生产周期输入框
+    # 生产周期快捷选择 + 手动输入
     st.sidebar.markdown("### 生产周期")
-    selected_cycle = st.sidebar.text_input(
+    recent_cycle_options = get_recent_cycles()
+    quick_cycle = st.sidebar.selectbox(
+        "快捷选择最近周期",
+        options=[""] + recent_cycle_options,
+        format_func=format_recent_cycle_option,
+        key="quick_cycle_select",
+        help="选择后优先按该周期筛选"
+    )
+    manual_cycle = st.sidebar.text_input(
         "输入生产周期",
         value="",
         placeholder="例如: 20260501",
         key="cycle_input",
-        help="留空显示全部数据，格式: YYYYMMDD"
+        help="不选择快捷周期时生效，留空显示全部数据，格式: YYYYMMDD"
     )
+    selected_cycle = quick_cycle or manual_cycle.strip()
 
     # 刷新按钮
     if st.sidebar.button("🔄 刷新数据", key="refresh_data_btn"):
@@ -1381,12 +3073,15 @@ def main():
     st.sidebar.markdown("---")
     st.sidebar.markdown("### 📝 说明")
     st.sidebar.markdown("- 留空显示全部数据")
+    st.sidebar.markdown("- 快捷选择包含最近四个生产周期")
+    st.sidebar.markdown("- 选择快捷周期后优先使用下拉值")
     st.sidebar.markdown("- 格式: YYYYMMDD")
     st.sidebar.markdown("- 如: 20260501")
+    st.sidebar.markdown("- 自动日报：周一/周五 19:00 发送")
 
     # ===== 主内容区域 =====
     st.title("🎬 生产监控面板")
-    st.markdown(f"**最后更新时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    st.markdown(f"**最后更新时间**: {get_local_now().strftime('%Y-%m-%d %H:%M:%S')}")
 
     # 显示当前筛选周期
     if selected_cycle:
@@ -1410,9 +3105,13 @@ def main():
     else:
         df_filtered = df
 
-    # 标签页：增加生产日报标签页
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "📊 概览", "🏢 系统对比", "⏱️ 实时监控", "📦 今日入库", "📋 生产日报"
+    # 拉取剧制作表数据（用于配音情况统计）
+    with st.spinner("正在拉取配音数据..."):
+        production_df = fetch_all_systems_production_data()
+
+    # 标签页：增加配音情况标签页
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+        "📊 概览", "🏢 系统对比", "⏱️ 实时监控", "📦 今日入库", "📋 生产日报", "🎤 配音情况"
     ])
 
     with tab1:
@@ -1429,6 +3128,9 @@ def main():
 
     with tab5:
         render_daily_report_tab(df_filtered)
+
+    with tab6:
+        render_dubbing_tab(production_df)
 
 
 if __name__ == "__main__":
