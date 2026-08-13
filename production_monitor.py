@@ -67,6 +67,16 @@ PRODUCTION_FIELDS = [
     "剧名", "当前状态", "当前制作周期", "语言", "制作备注", "制作耗时小时"
 ]
 
+# 自动上传统计直接读取各系统「上传表」。任务创建时间作为每日入表口径，
+# 上传状态和备注用于识别自动上传结果、运营手动上传及失败原因。
+UPLOAD_STAT_FIELDS = [
+    "任务创建时间", "剧id", "频道id", "剧名", "语言", "上传状态", "备注", "剧链接"
+]
+UPLOAD_STAT_SYSTEMS = [
+    name for name, config in CORE_TABLES.items()
+    if config.get("tables", {}).get("上传表")
+]
+
 # 颜色主题
 COLORS = {
     "primary": "#5470c6",
@@ -171,6 +181,103 @@ def fetch_production_data(system_name: str) -> list:
         return []
 
 
+@st.cache_data(ttl=300)
+def fetch_upload_statistics_data() -> pd.DataFrame:
+    """读取全部已配置上传表，并转换为自动上传统计明细。"""
+    client = LarkBitableClient()
+    rows = []
+
+    for system_name in UPLOAD_STAT_SYSTEMS:
+        config = CORE_TABLES.get(system_name, {})
+        table_id = config.get("tables", {}).get("上传表")
+        try:
+            records = client.search_all_records(
+                app_token=config.get("app_token"),
+                table_id=table_id,
+                field_names=UPLOAD_STAT_FIELDS,
+                filter_conditions=[],
+            )
+        except Exception as exc:
+            print(f"拉取 [{system_name}] 上传表失败: {exc}")
+            continue
+
+        for record in records:
+            fields = record.get("fields", {})
+            created_at = _parse_timestamp(fields.get("任务创建时间"))
+            if pd.isna(created_at):
+                continue
+            if not isinstance(created_at, datetime):
+                created_at = pd.to_datetime(created_at, errors="coerce")
+                if pd.isna(created_at):
+                    continue
+                created_at = created_at.to_pydatetime()
+            status = (_extract_text(fields.get("上传状态")) or "").strip()
+            remark = (_extract_text(fields.get("备注")) or "").strip()
+            is_manual = "运营手动上传" in remark
+            is_success = status in {"上传成功", "仅视频上传成功"}
+            is_failed = status == "上传失败"
+            rows.append({
+                "record_id": record.get("record_id"),
+                "系统": system_name,
+                "入表日期": created_at.date(),
+                "入表时间": created_at,
+                "剧名": _extract_text(fields.get("剧名")),
+                "频道id": _extract_text(fields.get("频道id")),
+                "上传状态": status,
+                "备注": remark,
+                "运营手动上传": is_manual,
+                "实际自动上传": (is_success or is_failed) and not is_manual,
+                "上传成功": is_success and not is_manual,
+                "上传失败": is_failed and not is_manual,
+            })
+
+    return pd.DataFrame(rows)
+
+
+def _classify_upload_failure_reason(remark: str) -> str:
+    """把容易变化的错误详情归并为可读、稳定的失败原因。"""
+    text = str(remark or "").strip()
+    lowered = text.lower()
+    rules = [
+        (("quota", "额度", "配额"), "频道/应用额度不足"),
+        (("token", "oauth", "授权", "凭证", "认证"), "Token或授权异常"),
+        (("subtitle", "caption", "字幕"), "字幕上传失败"),
+        (("network", "timeout", "timed out", "连接", "网络", "ssl"), "网络或超时"),
+        (("resource", "资源", "文件不存在", "找不到文件", "no such file"), "资源文件异常"),
+        (("youtube", "上传返回空", "upload"), "YouTube上传异常"),
+    ]
+    for keywords, category in rules:
+        if any(keyword in lowered for keyword in keywords):
+            return category
+    return text[:60] if text else "未填写失败原因"
+
+
+def _build_upload_daily_summary(df: pd.DataFrame) -> pd.DataFrame:
+    """按入表日期、系统生成任务 cohort 统计。"""
+    if df.empty:
+        return pd.DataFrame()
+    summary = (
+        df.groupby(["入表日期", "系统"], as_index=False)
+        .agg(
+            入表任务数=("record_id", "count"),
+            实际自动上传数=("实际自动上传", "sum"),
+            运营手动上传数=("运营手动上传", "sum"),
+            上传成功数=("上传成功", "sum"),
+            上传失败数=("上传失败", "sum"),
+        )
+    )
+    summary["实际使用率"] = summary["实际自动上传数"].div(
+        summary["入表任务数"].replace(0, pd.NA)
+    ).fillna(0).mul(100)
+    summary["实际成功率"] = summary["上传成功数"].div(
+        summary["实际自动上传数"].replace(0, pd.NA)
+    ).fillna(0).mul(100)
+    summary["实际失败率"] = summary["上传失败数"].div(
+        summary["实际自动上传数"].replace(0, pd.NA)
+    ).fillna(0).mul(100)
+    return summary.sort_values(["入表日期", "系统"], ascending=[False, True])
+
+
 def _recognition_records_to_dataframe(all_records: list) -> pd.DataFrame:
     """
     将剧识别表记录转换为面板使用的 DataFrame
@@ -184,6 +291,8 @@ def _recognition_records_to_dataframe(all_records: list) -> pd.DataFrame:
         row = {
             "record_id": record.get("record_id"),
             "系统": record.get("系统"),
+            "来源表": "剧识别表",
+            "来源表ID": CORE_TABLES.get(record.get("系统"), {}).get("tables", {}).get("剧识别表", ""),
             "剧id": fields.get("剧id"),
             "剧名": _extract_text(fields.get("剧名")),
             "生产状态": _extract_text(fields.get("生产状态")),
@@ -505,6 +614,63 @@ def calculate_avg_recognition_time(df: pd.DataFrame) -> dict:
     }
 
 
+def calculate_avg_bgm_time(df: pd.DataFrame) -> dict:
+    """计算BGM处理平均耗时，仅统计开始、结束时间均不为空的记录。"""
+    valid_df = df[
+        df["BGM开始处理时间"].notna() &
+        df["处理BGM结束时间"].notna()
+    ].copy()
+
+    if valid_df.empty:
+        return {"avg_bgm_time": None, "valid_count": 0}
+
+    valid_df["BGM开始处理时间"] = pd.to_datetime(
+        valid_df["BGM开始处理时间"], errors="coerce"
+    )
+    valid_df["处理BGM结束时间"] = pd.to_datetime(
+        valid_df["处理BGM结束时间"], errors="coerce"
+    )
+    valid_df = valid_df[
+        valid_df["BGM开始处理时间"].notna() &
+        valid_df["处理BGM结束时间"].notna()
+    ].copy()
+
+    if valid_df.empty:
+        return {"avg_bgm_time": None, "valid_count": 0}
+
+    valid_df["BGM处理耗时"] = (
+        valid_df["处理BGM结束时间"] - valid_df["BGM开始处理时间"]
+    ).dt.total_seconds() / 3600
+
+    return {
+        "avg_bgm_time": valid_df["BGM处理耗时"].mean(),
+        "valid_count": len(valid_df),
+    }
+
+
+def get_recognition_time_details(df: pd.DataFrame) -> pd.DataFrame:
+    """返回与识别耗时指标口径一致的逐条明细。"""
+    valid_df = df[
+        df["开始生产时间"].notna() &
+        df["识别角色结束时间"].notna()
+    ].copy()
+
+    if valid_df.empty:
+        return valid_df
+
+    valid_df["识别角色耗时(小时)"] = valid_df.apply(
+        lambda row: (row["识别角色结束时间"] - row["开始生产时间"]).total_seconds() / 3600,
+        axis=1
+    )
+    valid_df = valid_df[
+        (valid_df["识别角色耗时(小时)"] >= 0) &
+        (valid_df["识别角色耗时(小时)"] < 1000)
+    ].copy()
+    valid_df["是否报错"] = valid_df["失败类型"].notna() & (valid_df["失败类型"] != "")
+    valid_df["识别角色耗时(小时)"] = valid_df["识别角色耗时(小时)"].round(1)
+    return valid_df
+
+
 def calculate_cycle_recognition_time(df: pd.DataFrame) -> pd.DataFrame:
     """
     计算每个生产周期的平均识别角色耗时
@@ -552,6 +718,45 @@ def calculate_cycle_recognition_time(df: pd.DataFrame) -> pd.DataFrame:
     cycle_stats = cycle_stats.sort_values("生产周期")
 
     return cycle_stats
+
+
+def calculate_cycle_bgm_time(df: pd.DataFrame) -> pd.DataFrame:
+    """按生产周期计算BGM处理平均耗时，口径与总体BGM指标一致。"""
+    valid_df = df[
+        df["BGM开始处理时间"].notna() &
+        df["处理BGM结束时间"].notna() &
+        df["生产周期"].notna()
+    ].copy()
+
+    if valid_df.empty:
+        return pd.DataFrame()
+
+    valid_df["BGM开始处理时间"] = pd.to_datetime(
+        valid_df["BGM开始处理时间"], errors="coerce"
+    )
+    valid_df["处理BGM结束时间"] = pd.to_datetime(
+        valid_df["处理BGM结束时间"], errors="coerce"
+    )
+    valid_df["生产周期"] = valid_df["生产周期"].astype(str).str.strip()
+    valid_df = valid_df[
+        valid_df["BGM开始处理时间"].notna() &
+        valid_df["处理BGM结束时间"].notna() &
+        valid_df["生产周期"].ne("") &
+        valid_df["生产周期"].le(get_current_cycle())
+    ].copy()
+
+    if valid_df.empty:
+        return pd.DataFrame()
+
+    valid_df["BGM处理耗时"] = (
+        valid_df["处理BGM结束时间"] - valid_df["BGM开始处理时间"]
+    ).dt.total_seconds() / 3600
+
+    cycle_stats = valid_df.groupby("生产周期").agg(
+        BGM处理平均耗时=("BGM处理耗时", "mean"),
+        记录数=("BGM处理耗时", "count")
+    ).reset_index()
+    return cycle_stats.sort_values("生产周期")
 
 
 def calculate_avg_production_time(df: pd.DataFrame) -> dict:
@@ -856,7 +1061,7 @@ def estimate_completion_time(row: pd.Series, avg_times: dict) -> str:
             return f"{avg_times['avg_total_time']:.1f}h"
         return "暂无数据"
 
-    elif status in ["合并视频", "识别字幕", "识别角色"]:
+    elif status in ["合并视频", "识别字幕", "识别角色", "下载资源失败"]:
         # 识别中：预估 = 识别角色耗时的平均值
         if avg_times["avg_recognition_time"]:
             return f"{avg_times['avg_recognition_time']:.1f}h"
@@ -1139,18 +1344,37 @@ def render_overview_tab(df: pd.DataFrame):
     # 已完成：生产状态=完成
     completed_count = len(df[df["生产状态"] == "完成"])
 
-    # 未完成细分：识别完成、处理BGM、未开始
+    # 未完成统一按“非完成”计算，确保与“总剧数 - 已完成”完全一致。
+    # 之前这里只累加了三种状态，会漏掉合并视频、识别字幕、识别角色、失败等记录。
+    not_completed_count = total_count - completed_count
+
+    # 未完成细分
     not_started_count = len(df[df["生产状态"] == "未开始"])
     recognition_done_count = len(df[df["生产状态"] == "识别完成"])
     processing_bgm_count = len(df[df["生产状态"] == "处理BGM"])
-    not_completed_count = not_started_count + recognition_done_count + processing_bgm_count
+    in_progress_count = len(df[df["生产状态"].isin(["合并视频", "识别字幕", "识别角色"])])
+    regular_incomplete_statuses = [
+        "未开始", "识别完成", "处理BGM", "合并视频", "识别字幕", "识别角色"
+    ]
+    other_incomplete_df = df[
+        (df["生产状态"] != "完成") &
+        (~df["生产状态"].isin(regular_incomplete_statuses))
+    ].copy()
+    other_incomplete_count = len(other_incomplete_df)
 
-    # 失败细分：识别失败、BGM失败、失败处理中
-    recognize_fail_count = len(df[df["生产状态"] == "失败"])
-    bgm_fail_count = len(df[df["生产状态"] == "处理BGM失败"])
-    handling_fail_count = len(df[df["生产状态"] == "失败处理中"])
-    # 真正需要关注的失败（不含正在处理的）
-    total_fail_count = recognize_fail_count + bgm_fail_count
+    # 失败分为两个互斥口径：
+    # 1. 当前失败：当前生产状态就是“失败”
+    # 2. 历史失败：当前已进入“失败处理中/未开始”，但仍保留失败类型
+    failure_type_present = df["失败类型"].fillna("").astype(str).str.strip().ne("")
+    current_fail_mask = df["生产状态"] == "失败"
+    historical_fail_handling_mask = (df["生产状态"] == "失败处理中") & failure_type_present
+    historical_fail_not_started_mask = (df["生产状态"] == "未开始") & failure_type_present
+
+    current_fail_count = int(current_fail_mask.sum())
+    historical_fail_handling_count = int(historical_fail_handling_mask.sum())
+    historical_fail_not_started_count = int(historical_fail_not_started_mask.sum())
+    historical_fail_count = historical_fail_handling_count + historical_fail_not_started_count
+    total_fail_count = current_fail_count + historical_fail_count
 
     with col1:
         st.markdown(create_kpi_card("总剧数", total_count, color="#5470c6"), unsafe_allow_html=True)
@@ -1159,19 +1383,50 @@ def render_overview_tab(df: pd.DataFrame):
     with col3:
         st.markdown(create_kpi_card("未完成", not_completed_count, color="#f39c12"), unsafe_allow_html=True)
     with col4:
-        st.markdown(create_kpi_card("失败", total_fail_count, color="#ee6666"), unsafe_allow_html=True)
+        st.markdown(create_kpi_card("失败合计", total_fail_count, color="#ee6666"), unsafe_allow_html=True)
 
     st.markdown("---")
 
     # ===== 未完成细分 =====
     st.subheader("📋 未完成明细")
-    col_left, col_center, col_right = st.columns(3)
+    col_left, col_center, col_right, col_progress, col_other = st.columns(5)
     with col_left:
         st.markdown(create_kpi_card("识别完成", recognition_done_count, color="#27ae60"), unsafe_allow_html=True)
     with col_center:
         st.markdown(create_kpi_card("处理BGM", processing_bgm_count, color="#f39c12"), unsafe_allow_html=True)
     with col_right:
         st.markdown(create_kpi_card("未开始", not_started_count, color="#95a5a6"), unsafe_allow_html=True)
+    with col_progress:
+        st.markdown(create_kpi_card("生产中", in_progress_count, color="#3498db"), unsafe_allow_html=True)
+    with col_other:
+        st.markdown(create_kpi_card("其他未完成", other_incomplete_count, color="#e67e22"), unsafe_allow_html=True)
+
+    if not other_incomplete_df.empty:
+        other_status_counts = (
+            other_incomplete_df["生产状态"]
+            .fillna("空状态")
+            .astype(str)
+            .value_counts()
+            .to_dict()
+        )
+        other_status_summary = " | ".join(
+            f"{status}: {count} 条" for status, count in other_status_counts.items()
+        )
+        st.caption(f"其他未完成状态分布：{other_status_summary}")
+
+        incomplete_detail_columns = [
+            "系统", "剧名", "剧id", "生产周期", "生产状态", "失败类型",
+            "整备状态", "生产机器", "备注", "来源表", "来源表ID", "record_id"
+        ]
+        incomplete_detail_columns = [
+            column for column in incomplete_detail_columns if column in other_incomplete_df.columns
+        ]
+        with st.expander(f"🔎 查看其他未完成的 {other_incomplete_count} 条记录"):
+            st.dataframe(
+                other_incomplete_df[incomplete_detail_columns],
+                use_container_width=True,
+                hide_index=True
+            )
 
     st.markdown("---")
 
@@ -1179,29 +1434,64 @@ def render_overview_tab(df: pd.DataFrame):
     st.subheader("❌ 失败明细")
     col_left, col_center, col_right = st.columns(3)
     with col_left:
-        st.markdown(create_kpi_card("识别失败", recognize_fail_count, color="#c0392b"), unsafe_allow_html=True)
+        st.markdown(create_kpi_card("当前失败", current_fail_count, color="#c0392b"), unsafe_allow_html=True)
+        st.caption("生产状态 = 失败")
     with col_center:
-        st.markdown(create_kpi_card("BGM失败", bgm_fail_count, color="#e74c3c"), unsafe_allow_html=True)
+        st.markdown(create_kpi_card("历史失败", historical_fail_count, color="#e67e22"), unsafe_allow_html=True)
+        st.caption("状态为失败处理中/未开始，且失败类型不为空")
     with col_right:
-        st.markdown(create_kpi_card("失败处理中", handling_fail_count, color="#3498db"), unsafe_allow_html=True)
+        st.markdown(
+            create_kpi_card(
+                "历史失败状态分布",
+                f"处理中 {historical_fail_handling_count} / 未开始 {historical_fail_not_started_count}",
+                color="#3498db"
+            ),
+            unsafe_allow_html=True
+        )
 
     # 如果有未知状态，显示警告
     known_statuses = ["完成", "识别完成", "合并视频", "识别字幕", "识别角色", "处理BGM", "未开始", "失败", "处理BGM失败", "失败处理中"]
-    unknown_statuses = df[~df["生产状态"].isin(known_statuses)]["生产状态"].unique().tolist()
-    if unknown_statuses:
-        st.caption(f"⚠️ 未知状态: {unknown_statuses}")
+    unknown_status_df = df[~df["生产状态"].isin(known_statuses)].copy()
+    if not unknown_status_df.empty:
+        unknown_status_counts = (
+            unknown_status_df["生产状态"]
+            .fillna("空状态")
+            .astype(str)
+            .value_counts()
+            .to_dict()
+        )
+        unknown_status_summary = " | ".join(
+            f"{status}: {count} 条" for status, count in unknown_status_counts.items()
+        )
+        st.warning(f"⚠️ 其他生产状态：{unknown_status_summary}")
+
+        unknown_detail_columns = [
+            "系统", "剧名", "剧id", "生产周期", "生产状态", "失败类型",
+            "整备状态", "备注", "来源表", "来源表ID", "record_id"
+        ]
+        unknown_detail_columns = [
+            column for column in unknown_detail_columns if column in unknown_status_df.columns
+        ]
+        with st.expander(f"🔎 查看其他生产状态的 {len(unknown_status_df)} 条记录"):
+            st.dataframe(
+                unknown_status_df[unknown_detail_columns],
+                use_container_width=True,
+                hide_index=True
+            )
 
     st.markdown("---")
 
     # ===== 识别角色耗时指标 =====
-    st.subheader("⏱️ 识别角色耗时分析")
+    st.subheader("⏱️ 识别角色与BGM处理耗时分析")
 
     # 计算平均识别角色耗时
     recognition_time_stats = calculate_avg_recognition_time(df)
+    bgm_time_stats = calculate_avg_bgm_time(df)
     cycle_recognition_stats = calculate_cycle_recognition_time(df)
+    cycle_bgm_stats = calculate_cycle_bgm_time(df)
 
-    # 第一行：总体平均识别角色耗时
-    col1, col2, col3 = st.columns(3)
+    # 第一行：识别角色与BGM处理平均耗时
+    col1, col2, col3, col4 = st.columns(4)
 
     with col1:
         # 显示总体平均识别角色耗时卡片
@@ -1260,7 +1550,53 @@ def render_overview_tab(df: pd.DataFrame):
                 unsafe_allow_html=True
             )
 
-    st.caption("📋 筛选条件：开始生产时间、识别角色结束时间均不为空 | 无报错：失败类型为空 | 有报错：失败类型不为空")
+    with col4:
+        if bgm_time_stats["avg_bgm_time"] is not None:
+            avg_time_str = f"{bgm_time_stats['avg_bgm_time']:.1f}h"
+            st.markdown(
+                create_kpi_card("BGM处理平均耗时", avg_time_str, color="#9a60b4"),
+                unsafe_allow_html=True
+            )
+            st.caption(f"📊 基于 {bgm_time_stats['valid_count']} 条有效记录")
+        else:
+            st.markdown(
+                create_kpi_card("BGM处理平均耗时", "暂无数据", color="#9a60b4"),
+                unsafe_allow_html=True
+            )
+
+    # 指标追溯入口：明细严格使用与上方识别耗时相同的时间及异常值筛选口径
+    recognition_details = get_recognition_time_details(df)
+    error_details = (
+        recognition_details[recognition_details["是否报错"]].copy()
+        if not recognition_details.empty else recognition_details.copy()
+    )
+    if not error_details.empty:
+        error_details["来源"] = error_details["系统"].fillna("") + " / " + error_details["来源表"].fillna("剧识别表")
+        detail_columns = [
+            "来源", "来源表ID", "record_id", "剧id", "剧名", "生产周期", "生产状态",
+            "失败类型", "开始生产时间", "识别角色结束时间", "识别角色耗时(小时)", "备注"
+        ]
+        detail_columns = [column for column in detail_columns if column in error_details.columns]
+        error_details_display = error_details[detail_columns].sort_values(
+            "识别角色耗时(小时)", ascending=False
+        )
+
+        with st.expander(f"🔎 查看识别时有报错的 {len(error_details_display)} 条记录及来源表"):
+            st.caption("来源格式：系统 / 表名；表 ID 和 record_id 可用于回查飞书原始记录。")
+            st.dataframe(error_details_display, use_container_width=True, hide_index=True)
+            st.download_button(
+                label="📥 导出识别报错明细（CSV）",
+                data=error_details_display.to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"识别报错明细_{get_local_now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv",
+                key="download_recognition_error_details",
+            )
+
+    st.caption(
+        "📋 识别耗时：开始生产时间、识别角色结束时间均不为空 | "
+        "BGM耗时：BGM开始处理时间、处理BGM结束时间均不为空 | "
+        "无报错：失败类型为空 | 有报错：失败类型不为空"
+    )
 
     # 第二行：失败类型占比饼图（仅显示有报错的记录）
     error_type_distribution = recognition_time_stats.get("error_type_distribution", {})
@@ -1348,6 +1684,47 @@ def render_overview_tab(df: pd.DataFrame):
         render_pyecharts(line)
     else:
         st.info("暂无各周期识别角色耗时数据")
+
+    # 第四行：各生产周期BGM处理平均耗时折线图
+    if not cycle_bgm_stats.empty:
+        bgm_cycles = cycle_bgm_stats["生产周期"].tolist()
+        bgm_avg_times = cycle_bgm_stats["BGM处理平均耗时"].tolist()
+        bgm_counts = cycle_bgm_stats["记录数"].tolist()
+
+        bgm_line = (
+            Line(init_opts=opts.InitOpts(width="100%", height="300px", theme="light"))
+            .add_xaxis(bgm_cycles)
+            .add_yaxis(
+                series_name="BGM处理平均耗时",
+                y_axis=[round(value, 1) for value in bgm_avg_times],
+                symbol="circle",
+                symbol_size=8,
+                linestyle_opts=opts.LineStyleOpts(width=2, color="#9a60b4"),
+                itemstyle_opts=opts.ItemStyleOpts(color="#9a60b4"),
+                label_opts=opts.LabelOpts(is_show=True, position="top", formatter="{c}h"),
+            )
+            .set_global_opts(
+                title_opts=opts.TitleOpts(title="各生产周期BGM处理平均耗时变化"),
+                xaxis_opts=opts.AxisOpts(axislabel_opts=opts.LabelOpts(rotate=30)),
+                yaxis_opts=opts.AxisOpts(name="小时"),
+                tooltip_opts=opts.TooltipOpts(
+                    trigger="axis",
+                    formatter=JsCode("""
+                        function(params) {
+                            var cycle = params[0].axisValue;
+                            var time = params[0].value;
+                            var idx = params[0].dataIndex;
+                            var count = """ + str(bgm_counts) + """[idx];
+                            return '周期: ' + cycle + '<br/>BGM平均耗时: ' + time + 'h<br/>记录数: ' + count;
+                        }
+                    """)
+                ),
+                legend_opts=opts.LegendOpts(pos_top="top"),
+            )
+        )
+        render_pyecharts(bgm_line)
+    else:
+        st.info("暂无各周期BGM处理耗时数据")
 
     st.markdown("---")
 
@@ -2040,6 +2417,330 @@ def render_today_input_tab(df: pd.DataFrame):
                 )
             )
             render_pyecharts(line)
+
+
+def render_production_schedule_tab(df: pd.DataFrame):
+    """合并展示全部系统剧识别任务，并按预计发布日期生成生产排期。"""
+    st.header("📅 生产任务排期")
+    st.caption("汇总所有系统剧识别表中生产状态不等于“完成”的任务，按预计发布日期从早到晚排列；未填写预计发布日期的任务排在最后。")
+
+    if df.empty:
+        st.warning("暂无可排期的生产任务。")
+        return
+
+    schedule_df = df[
+        df["生产状态"].fillna("").astype(str).str.strip().ne("完成")
+    ].copy()
+    if schedule_df.empty:
+        st.success("当前没有未完成的生产任务。")
+        return
+    schedule_df["预计发布日期"] = pd.to_datetime(
+        schedule_df["预计发布日期"], errors="coerce"
+    )
+    schedule_df["入表时间"] = pd.to_datetime(
+        schedule_df["入表时间"], errors="coerce"
+    )
+
+    # 与实时监控使用相同的状态耗时口径，并转换为具体的预计产出时间。
+    avg_times = calculate_avg_times(df)
+    estimate_base_time = get_local_now()
+
+    def estimate_output_at(row: pd.Series) -> str:
+        status = str(row.get("生产状态") or "").strip()
+        estimate_hours = None
+        if status == "未开始":
+            estimate_hours = avg_times.get("avg_total_time")
+        elif status in ["合并视频", "识别字幕", "识别角色", "下载资源失败"]:
+            estimate_hours = avg_times.get("avg_recognition_time")
+        elif status in ["处理BGM", "识别完成"]:
+            estimate_hours = avg_times.get("avg_bgm_time")
+
+        if estimate_hours is None or pd.isna(estimate_hours):
+            return "等待处理" if status else "暂无数据"
+        return (estimate_base_time + timedelta(hours=float(estimate_hours))).strftime(
+            "%Y-%m-%d %H:%M"
+        )
+
+    schedule_df["预计产出时间"] = schedule_df.apply(estimate_output_at, axis=1)
+
+    drama_keyword = st.text_input(
+        "搜索剧名",
+        placeholder="输入剧名关键字",
+        key="production_schedule_drama_keyword",
+    ).strip()
+    if drama_keyword:
+        schedule_df = schedule_df[
+            schedule_df["剧名"].fillna("").astype(str).str.contains(
+                drama_keyword, case=False, regex=False
+            )
+        ]
+
+    if schedule_df.empty:
+        st.info("当前筛选条件下没有生产任务。")
+        return
+
+    today = get_local_now().date()
+    release_dates = schedule_df["预计发布日期"].dt.date
+    overdue_count = int(release_dates.lt(today).sum())
+    today_count = int(release_dates.eq(today).sum())
+    upcoming_count = int(release_dates.gt(today).sum())
+    unscheduled_count = int(schedule_df["预计发布日期"].isna().sum())
+
+    metric_cols = st.columns(5)
+    metric_values = [
+        ("排期任务总数", len(schedule_df), "#5470c6"),
+        ("逾期未完成", overdue_count, "#ee6666"),
+        ("今日发布", today_count, "#fac858"),
+        ("后续待处理", upcoming_count, "#73c0de"),
+        ("未填写发布日期", unscheduled_count, "#95a5a6"),
+    ]
+    for col, (title, value, color) in zip(metric_cols, metric_values):
+        with col:
+            st.markdown(create_kpi_card(title, value, color=color), unsafe_allow_html=True)
+
+    schedule_df = schedule_df.sort_values(
+        ["预计发布日期", "入表时间", "系统"],
+        ascending=[True, True, True],
+        na_position="last",
+    ).reset_index(drop=True)
+    schedule_df.insert(0, "处理顺序", schedule_df.index + 1)
+    schedule_df["预计发布日期"] = schedule_df["预计发布日期"].dt.strftime("%Y-%m-%d").fillna("未排期")
+    schedule_df["入表时间"] = schedule_df["入表时间"].dt.strftime("%Y-%m-%d %H:%M").fillna("")
+
+    display_columns = [
+        "处理顺序", "预计发布日期", "预计产出时间", "系统", "剧名", "生产状态",
+        "整备状态", "入表时间", "失败类型",
+    ]
+    display_columns = [column for column in display_columns if column in schedule_df.columns]
+    st.markdown("---")
+    st.subheader("📋 全系统任务处理顺序")
+    st.dataframe(
+        schedule_df[display_columns],
+        use_container_width=True,
+        hide_index=True,
+        height=680,
+    )
+
+
+def render_upload_statistics_tab(upload_df: pd.DataFrame):
+    """渲染自动上传每日大盘。"""
+    st.header("🚀 自动上传统计")
+    st.caption(
+        "统计口径：按上传表任务的创建日期归属；实际自动上传=上传成功/仅视频上传成功/上传失败，"
+        "且排除备注为“运营手动上传”的任务。实际使用率=实际自动上传数÷入表任务数，"
+        "实际成功率=上传成功数÷实际自动上传数。"
+    )
+
+    if upload_df.empty:
+        st.warning("暂无上传表数据，请检查上传表配置或任务创建时间字段。")
+        return
+
+    min_date = upload_df["入表日期"].min()
+    max_date = upload_df["入表日期"].max()
+    default_start = max(min_date, max_date - timedelta(days=29))
+    filter_col1, filter_col2 = st.columns([2, 3])
+    with filter_col1:
+        date_range = st.date_input(
+            "统计日期",
+            value=(default_start, max_date),
+            min_value=min_date,
+            max_value=max_date,
+            key="upload_statistics_date_range",
+        )
+    with filter_col2:
+        selected_systems = st.multiselect(
+            "系统",
+            options=sorted(upload_df["系统"].dropna().unique().tolist()),
+            default=sorted(upload_df["系统"].dropna().unique().tolist()),
+            key="upload_statistics_systems",
+        )
+
+    filtered = upload_df.copy()
+    if isinstance(date_range, (tuple, list)) and len(date_range) == 2:
+        filtered = filtered[
+            filtered["入表日期"].between(date_range[0], date_range[1])
+        ]
+    if selected_systems:
+        filtered = filtered[filtered["系统"].isin(selected_systems)]
+    else:
+        filtered = filtered.iloc[0:0]
+
+    if filtered.empty:
+        st.info("当前筛选范围内暂无上传任务。")
+        return
+
+    total_input = len(filtered)
+    total_actual = int(filtered["实际自动上传"].sum())
+    total_manual = int(filtered["运营手动上传"].sum())
+    total_success = int(filtered["上传成功"].sum())
+    total_failed = int(filtered["上传失败"].sum())
+    usage_rate = total_actual / total_input * 100 if total_input else 0
+    success_rate = total_success / total_actual * 100 if total_actual else 0
+
+    metric_cols = st.columns(7)
+    metrics = [
+        ("入表任务", total_input, "#5470c6"),
+        ("实际自动上传", total_actual, "#73c0de"),
+        ("实际使用率", f"{usage_rate:.1f}%", "#9a60b4"),
+        ("运营手动上传", total_manual, "#fac858"),
+        ("上传成功", total_success, "#91cc75"),
+        ("实际成功率", f"{success_rate:.1f}%", "#3ba272"),
+        ("上传失败", total_failed, "#ee6666"),
+    ]
+    for col, (title, value, color) in zip(metric_cols, metrics):
+        with col:
+            st.markdown(create_kpi_card(title, value, color=color), unsafe_allow_html=True)
+    st.caption(f"实际成功率分子/分母：{total_success}/{total_actual}")
+
+    daily_system = _build_upload_daily_summary(filtered)
+    daily_total = (
+        filtered.groupby("入表日期", as_index=False)
+        .agg(
+            入表任务数=("record_id", "count"),
+            实际自动上传数=("实际自动上传", "sum"),
+            运营手动上传数=("运营手动上传", "sum"),
+            上传成功数=("上传成功", "sum"),
+            上传失败数=("上传失败", "sum"),
+        )
+        .sort_values("入表日期")
+    )
+
+    st.markdown("---")
+    st.subheader("📈 每日上传趋势")
+    trend = Line(init_opts=opts.InitOpts(height="420px"))
+    trend.add_xaxis([str(value) for value in daily_total["入表日期"]])
+    for column, label in [
+        ("入表任务数", "入表任务"),
+        ("实际自动上传数", "实际自动上传"),
+        ("运营手动上传数", "运营手动上传"),
+        ("上传成功数", "上传成功"),
+        ("上传失败数", "上传失败"),
+    ]:
+        trend.add_yaxis(label, daily_total[column].astype(int).tolist(), is_smooth=True)
+    trend.set_global_opts(
+        tooltip_opts=opts.TooltipOpts(trigger="axis"),
+        legend_opts=opts.LegendOpts(pos_top="2%"),
+        xaxis_opts=opts.AxisOpts(axislabel_opts=opts.LabelOpts(rotate=35)),
+        yaxis_opts=opts.AxisOpts(name="任务数", min_=0),
+    )
+    render_pyecharts(trend)
+
+    st.markdown("---")
+    st.subheader("📉 每日自动上传成功率 / 失败率")
+    st.caption(
+        "横轴按任务创建日期统计；实际成功率=上传成功数÷实际自动上传数，"
+        "实际失败率=上传失败数÷实际自动上传数。当天没有实际上传时不绘制比率点。"
+    )
+    rate_scope_options = ["所有系统（合并）"] + sorted(
+        filtered["系统"].dropna().unique().tolist()
+    )
+    rate_scope = st.selectbox(
+        "成功率/失败率统计范围",
+        options=rate_scope_options,
+        key="upload_rate_scope",
+    )
+    rate_source = (
+        filtered
+        if rate_scope == "所有系统（合并）"
+        else filtered[filtered["系统"] == rate_scope]
+    )
+    daily_rates = (
+        rate_source.groupby("入表日期", as_index=False)
+        .agg(
+            实际自动上传数=("实际自动上传", "sum"),
+            上传成功数=("上传成功", "sum"),
+            上传失败数=("上传失败", "sum"),
+        )
+        .sort_values("入表日期")
+    )
+    valid_upload_counts = daily_rates["实际自动上传数"].replace(0, pd.NA)
+    daily_rates["实际成功率"] = daily_rates["上传成功数"].div(valid_upload_counts).mul(100)
+    daily_rates["实际失败率"] = daily_rates["上传失败数"].div(valid_upload_counts).mul(100)
+
+    rate_line = Line(init_opts=opts.InitOpts(height="420px"))
+    rate_line.add_xaxis([str(value) for value in daily_rates["入表日期"]])
+    rate_line.add_yaxis(
+        "实际成功率",
+        [round(value, 1) if pd.notna(value) else None for value in daily_rates["实际成功率"]],
+        is_smooth=False,
+        symbol="circle",
+        symbol_size=6,
+        linestyle_opts=opts.LineStyleOpts(width=2, color="#3ba272"),
+        itemstyle_opts=opts.ItemStyleOpts(color="#3ba272"),
+        label_opts=opts.LabelOpts(is_show=False),
+    )
+    rate_line.add_yaxis(
+        "实际失败率",
+        [round(value, 1) if pd.notna(value) else None for value in daily_rates["实际失败率"]],
+        is_smooth=False,
+        symbol="circle",
+        symbol_size=6,
+        linestyle_opts=opts.LineStyleOpts(width=2, color="#ee6666"),
+        itemstyle_opts=opts.ItemStyleOpts(color="#ee6666"),
+        label_opts=opts.LabelOpts(is_show=False),
+    )
+    rate_line.set_global_opts(
+        tooltip_opts=opts.TooltipOpts(trigger="axis"),
+        legend_opts=opts.LegendOpts(pos_top="2%"),
+        xaxis_opts=opts.AxisOpts(
+            type_="category",
+            boundary_gap=False,
+            axislabel_opts=opts.LabelOpts(rotate=30, font_size=11),
+            splitline_opts=opts.SplitLineOpts(is_show=False),
+        ),
+        yaxis_opts=opts.AxisOpts(
+            min_=0,
+            max_=100,
+            interval=20,
+            axislabel_opts=opts.LabelOpts(formatter="{value}%", font_size=11),
+            splitline_opts=opts.SplitLineOpts(
+                is_show=True,
+                linestyle_opts=opts.LineStyleOpts(color="#e8edf3", width=1),
+            ),
+        ),
+    )
+    render_pyecharts(rate_line)
+
+    st.markdown("---")
+    st.subheader("🏢 每日各系统明细")
+    display_summary = daily_system.copy()
+    display_summary["入表日期"] = display_summary["入表日期"].astype(str)
+    display_summary["实际使用率"] = display_summary["实际使用率"].map(lambda value: f"{value:.1f}%")
+    display_summary["实际成功率"] = display_summary["实际成功率"].map(lambda value: f"{value:.1f}%")
+    display_summary["实际失败率"] = display_summary["实际失败率"].map(lambda value: f"{value:.1f}%")
+    st.dataframe(display_summary, use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+    st.subheader("❌ 失败原因占比")
+    failed_df = filtered[filtered["上传失败"]].copy()
+    if failed_df.empty:
+        st.success("当前筛选范围内没有自动上传失败任务。")
+    else:
+        failed_df["失败原因"] = failed_df["备注"].map(_classify_upload_failure_reason)
+        reason_stats = failed_df["失败原因"].value_counts().rename_axis("失败原因").reset_index(name="失败数")
+        reason_stats["占比"] = reason_stats["失败数"].div(reason_stats["失败数"].sum()).mul(100)
+        chart_col, table_col = st.columns([3, 2])
+        with chart_col:
+            reason_pie = Pie(init_opts=opts.InitOpts(height="400px"))
+            reason_pie.add(
+                "失败原因",
+                [list(item) for item in reason_stats[["失败原因", "失败数"]].itertuples(index=False, name=None)],
+                radius=["38%", "68%"],
+            )
+            reason_pie.set_global_opts(legend_opts=opts.LegendOpts(type_="scroll", orient="vertical", pos_left="2%"))
+            reason_pie.set_series_opts(label_opts=opts.LabelOpts(formatter="{b}: {d}%"))
+            render_pyecharts(reason_pie)
+        with table_col:
+            reason_display = reason_stats.copy()
+            reason_display["占比"] = reason_display["占比"].map(lambda value: f"{value:.1f}%")
+            st.dataframe(reason_display, use_container_width=True, hide_index=True)
+        with st.expander(f"查看 {len(failed_df)} 条上传失败明细"):
+            st.dataframe(
+                failed_df[["入表日期", "系统", "剧名", "频道id", "失败原因", "备注"]]
+                .sort_values(["入表日期", "系统"], ascending=[False, True]),
+                use_container_width=True,
+                hide_index=True,
+            )
 
 
 def get_current_cycle() -> str:
@@ -3105,13 +3806,13 @@ def main():
     else:
         df_filtered = df
 
-    # 拉取剧制作表数据（用于配音情况统计）
-    with st.spinner("正在拉取配音数据..."):
-        production_df = fetch_all_systems_production_data()
+    # # 拉取剧制作表数据（用于配音情况统计）
+    # with st.spinner("正在拉取配音数据..."):
+    #     production_df = fetch_all_systems_production_data()
 
-    # 标签页：增加配音情况标签页
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-        "📊 概览", "🏢 系统对比", "⏱️ 实时监控", "📦 今日入库", "📋 生产日报", "🎤 配音情况"
+    # 标签页：增加自动上传统计大盘
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+        "📊 概览", "🏢 系统对比", "⏱️ 实时监控", "📦 今日入库", "📋 生产日报", "🎤 配音情况", "🚀 自动上传统计", "📅 生产任务排期"
     ])
 
     with tab1:
@@ -3129,8 +3830,16 @@ def main():
     with tab5:
         render_daily_report_tab(df_filtered)
 
-    with tab6:
-        render_dubbing_tab(production_df)
+    # with tab6:
+    #     render_dubbing_tab(production_df)
+
+    with tab7:
+        with st.spinner("正在拉取各系统上传表数据..."):
+            upload_df = fetch_upload_statistics_data()
+        render_upload_statistics_tab(upload_df)
+
+    with tab8:
+        render_production_schedule_tab(df)
 
 
 if __name__ == "__main__":
