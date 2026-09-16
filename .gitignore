@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+
+auto_daily_report_state.json
+recognition_failure_alert_state.json
+recognition_no_error_*.csv

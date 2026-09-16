@@ -93,10 +93,10 @@ PRODUCTION_FIELDS = [
     "需求提交时间", "整备完成时间", "制作完成时间", "制作总耗时"
 ]
 
-# 自动上传统计直接读取各系统「上传表」。任务创建时间作为每日入表口径，
+# 自动上传统计直接读取各系统「上传表」。入表时间作为每日统计口径，
 # 上传状态和备注用于识别自动上传结果、运营手动上传及失败原因。
 UPLOAD_STAT_FIELDS = [
-    "任务创建时间", "剧id", "频道id", "剧名", "语言", "上传状态", "备注", "剧链接"
+    "入表时间", "剧id", "频道id", "剧名", "语言", "上传状态", "备注", "剧链接"
 ]
 UPLOAD_STAT_SYSTEMS = [
     name for name, config in CORE_TABLES.items()
@@ -148,14 +148,37 @@ def _build_cycle_filter_conditions(field_name: str, recent_cycles: tuple) -> lis
     ]
 
 
+def _fetch_monitor_records(client, *, strict=False, **query) -> list:
+    """兼容原客户端接口；Status 单独检查分页失败，避免误判为空任务。"""
+    if not strict:
+        return client.search_all_records(**query)
+
+    records = []
+    page_token = ""
+    seen_tokens = set()
+    while True:
+        response = client.search_records(**query, page_token=page_token)
+        if not isinstance(response, dict) or not isinstance(response.get("records"), list):
+            raise RuntimeError("飞书记录读取失败，未使用不完整分页结果")
+        records.extend(response["records"])
+        page_token = response.get("page_token") or ""
+        if not page_token:
+            return records
+        if page_token in seen_tokens:
+            raise RuntimeError("飞书分页游标重复，未使用不完整分页结果")
+        seen_tokens.add(page_token)
+
+
 @st.cache_data(ttl=DASHBOARD_CACHE_TTL_SECONDS, show_spinner=False)
-def fetch_recognition_data(system_name: str, recent_cycles: tuple) -> list:
+def fetch_recognition_data(system_name: str, recent_cycles: tuple, strict=False) -> list:
     """
     从指定系统的剧识别表拉取最近若干生产周期的数据。
     """
     try:
         config = CORE_TABLES.get(system_name)
         if not config:
+            if strict:
+                raise ValueError("未配置业务系统")
             return []
 
         app_token = config.get("app_token")
@@ -163,17 +186,20 @@ def fetch_recognition_data(system_name: str, recent_cycles: tuple) -> list:
         recognition_table_id = tables.get("剧识别表")
 
         if not recognition_table_id:
+            if strict:
+                raise ValueError("未配置剧识别表")
             return []
 
         client = LarkBitableClient()
 
-        records = client.search_all_records(
+        records = _fetch_monitor_records(
+            client, strict=strict,
             app_token=app_token,
             table_id=recognition_table_id,
             field_names=RECOGNITION_FIELDS,
             filter_conditions=_build_cycle_filter_conditions(
                 "生产周期", recent_cycles
-            ),
+            ) if recent_cycles is not None else [],
             filter_conjunction="or",
         )
 
@@ -183,18 +209,22 @@ def fetch_recognition_data(system_name: str, recent_cycles: tuple) -> list:
         return records
 
     except Exception as e:
+        if strict:
+            raise
         st.error(f"拉取 [{system_name}] 数据失败: {e}")
         return []
 
 
 @st.cache_data(ttl=DASHBOARD_CACHE_TTL_SECONDS, show_spinner=False)
-def fetch_production_data(system_name: str, recent_cycles: tuple) -> list:
+def fetch_production_data(system_name: str, recent_cycles: tuple, strict=False) -> list:
     """
     从指定系统的剧制作表-新拉取最近若干制作周期的数据。
     """
     try:
         config = CORE_TABLES.get(system_name)
         if not config:
+            if strict:
+                raise ValueError("未配置业务系统")
             return []
 
         app_token = config.get("app_token")
@@ -202,6 +232,8 @@ def fetch_production_data(system_name: str, recent_cycles: tuple) -> list:
         production_table_id = tables.get("剧制作表-新")
 
         if not production_table_id:
+            if strict:
+                raise ValueError("未配置剧制作表-新")
             return []
 
         client = LarkBitableClient()
@@ -210,13 +242,14 @@ def fetch_production_data(system_name: str, recent_cycles: tuple) -> list:
             if not (system_name == "外部制作" and field_name == "申请日期")
         ]
 
-        records = client.search_all_records(
+        records = _fetch_monitor_records(
+            client, strict=strict,
             app_token=app_token,
             table_id=production_table_id,
             field_names=production_fields,
             filter_conditions=_build_cycle_filter_conditions(
                 "当前制作周期", recent_cycles
-            ),
+            ) if recent_cycles is not None else [],
             filter_conjunction="or",
         )
 
@@ -226,6 +259,8 @@ def fetch_production_data(system_name: str, recent_cycles: tuple) -> list:
         return records
 
     except Exception as e:
+        if strict:
+            raise
         import traceback
         print(f"拉取 [{system_name}] 剧制作表数据失败: {e}")
         print(traceback.format_exc())
@@ -233,35 +268,39 @@ def fetch_production_data(system_name: str, recent_cycles: tuple) -> list:
 
 
 @st.cache_data(ttl=DASHBOARD_CACHE_TTL_SECONDS, show_spinner=False)
-def fetch_upload_statistics_data() -> pd.DataFrame:
+def fetch_upload_statistics_data(strict=False, system_names=None) -> pd.DataFrame:
     """读取全部已配置上传表，并转换为自动上传统计明细。"""
     client = LarkBitableClient()
     rows = []
 
-    for system_name in UPLOAD_STAT_SYSTEMS:
+    for system_name in (UPLOAD_STAT_SYSTEMS if system_names is None else system_names):
         config = CORE_TABLES.get(system_name, {})
         table_id = config.get("tables", {}).get("上传表")
         try:
-            records = client.search_all_records(
+            records = _fetch_monitor_records(
+                client, strict=strict,
                 app_token=config.get("app_token"),
                 table_id=table_id,
                 field_names=UPLOAD_STAT_FIELDS,
                 filter_conditions=[],
             )
         except Exception as exc:
+            if strict:
+                raise
             print(f"拉取 [{system_name}] 上传表失败: {exc}")
             continue
 
         for record in records:
             fields = record.get("fields", {})
-            created_at = _parse_timestamp(fields.get("任务创建时间"))
-            if pd.isna(created_at):
+            created_at = _parse_timestamp(fields.get("入表时间"))
+            if pd.isna(created_at) and not strict:
                 continue
-            if not isinstance(created_at, datetime):
+            if pd.notna(created_at) and not isinstance(created_at, datetime):
                 created_at = pd.to_datetime(created_at, errors="coerce")
-                if pd.isna(created_at):
+                if pd.isna(created_at) and not strict:
                     continue
-                created_at = created_at.to_pydatetime()
+                if pd.notna(created_at):
+                    created_at = created_at.to_pydatetime()
             status = (_extract_text(fields.get("上传状态")) or "").strip()
             remark = (_extract_text(fields.get("备注")) or "").strip()
             is_manual = "运营手动上传" in remark
@@ -270,7 +309,7 @@ def fetch_upload_statistics_data() -> pd.DataFrame:
             rows.append({
                 "record_id": record.get("record_id"),
                 "系统": system_name,
-                "入表日期": created_at.date(),
+                "入表日期": created_at.date() if pd.notna(created_at) else None,
                 "入表时间": created_at,
                 "剧名": _extract_text(fields.get("剧名")),
                 "频道id": _extract_text(fields.get("频道id")),
@@ -474,6 +513,11 @@ def fetch_all_systems_production_data() -> pd.DataFrame:
         records = fetch_production_data(system_name, recent_cycles)
         all_records.extend(records)
 
+    return _production_records_to_dataframe(all_records)
+
+
+def _production_records_to_dataframe(all_records: list) -> pd.DataFrame:
+    """供普通报表和独立 Status 采集器共享字段转换。"""
     if not all_records:
         return pd.DataFrame()
 
@@ -2158,41 +2202,76 @@ def render_overview_tab(df: pd.DataFrame, trend_df: pd.DataFrame = None):
 
     duration_map_html = f"""
     <style>
-        .duration-map {{ width: 100%; color: #fff; font-family: sans-serif; }}
+        .duration-map {{
+            width: 100%; color: #fff; font-family: sans-serif;
+            container-type: inline-size; container-name: duration-map;
+        }}
         .duration-map-root {{
             background: linear-gradient(135deg, #8e44ad, #9b59b6);
             border-radius: 10px; padding: 18px; text-align: center;
             font-weight: 700; font-size: 18px; margin-bottom: 8px;
         }}
-        .duration-map-level {{ display: flex; gap: 8px; min-height: 255px; }}
+        .duration-map-level {{
+            display: flex; flex-wrap: wrap; gap: 8px; min-height: 255px;
+        }}
         .duration-map-group {{
-            flex-basis: 0; min-width: 0; border-radius: 10px;
+            /*
+             * 耗时差距很大时仍为较小阶段保留可读宽度；剩余空间继续按
+             * inline flex-grow 的耗时权重分配，兼顾比例表达与内容可读性。
+             */
+            flex-basis: 220px; min-width: min(220px, 100%); border-radius: 10px;
             padding: 6px; display: flex; flex-direction: column;
+            box-sizing: border-box; overflow: hidden;
         }}
         .duration-map-group-title {{
             border-radius: 7px; padding: 12px 6px; text-align: center;
-            font-weight: 700; font-size: 15px; margin-bottom: 6px;
+            font-weight: 700; font-size: clamp(12px, 1.1vw, 15px);
+            line-height: 1.35; margin-bottom: 6px; word-break: keep-all;
         }}
         .duration-map-children {{ display: flex; gap: 6px; flex: 1; min-width: 0; }}
         .duration-map-block {{
-            flex-basis: 0; min-width: 0; border-radius: 7px; padding: 10px 5px;
+            flex-basis: 118px; min-width: 0; border-radius: 7px; padding: 10px 5px;
             display: flex; flex-direction: column; align-items: center;
-            justify-content: center; text-align: center; font-size: 13px;
-            font-weight: 600; overflow: hidden;
+            justify-content: center; text-align: center;
+            font-size: clamp(11px, .95vw, 13px); line-height: 1.35;
+            font-weight: 600; overflow: hidden; box-sizing: border-box;
         }}
         .duration-map-actual {{ justify-content: flex-start; padding: 0; }}
-        .duration-map-actual-title {{ width: 100%; padding: 10px 4px; }}
+        .duration-map-actual-title {{
+            width: 100%; padding: 10px 4px; box-sizing: border-box;
+            word-break: keep-all;
+        }}
         .duration-map-grandchildren {{
             display: flex; gap: 5px; width: 100%; flex: 1; padding: 0 5px 5px;
             box-sizing: border-box;
         }}
         .duration-map-small {{
-            flex-basis: 0; min-width: 0; border-radius: 6px; padding: 8px 3px;
+            flex-basis: 64px; min-width: 0; border-radius: 6px; padding: 8px 3px;
             display: flex; align-items: center; justify-content: center;
-            text-align: center; font-size: 12px; overflow: hidden;
+            text-align: center; font-size: clamp(10px, .85vw, 12px);
+            line-height: 1.45; overflow: hidden; box-sizing: border-box;
         }}
-        .duration-map-value {{ font-size: 17px; margin-top: 4px; }}
+        .duration-map-label {{ word-break: keep-all; overflow-wrap: normal; }}
+        .duration-map-value {{
+            font-size: clamp(14px, 1.2vw, 17px); margin-top: 4px;
+            white-space: nowrap;
+        }}
         .duration-map-count {{ font-size: 11px; opacity: .9; margin-top: 2px; }}
+
+        /* 图表容器变窄时分组改为上下排列，避免任何阶段被挤成竖排文字。 */
+        @container duration-map (max-width: 680px) {{
+            .duration-map-level {{ flex-direction: column; min-height: 520px; }}
+            .duration-map-group {{
+                flex: 1 1 auto !important; width: 100%; min-height: 245px;
+            }}
+        }}
+        /* 兼容尚未支持容器查询的浏览器。 */
+        @media (max-width: 760px) {{
+            .duration-map-level {{ flex-direction: column; min-height: 520px; }}
+            .duration-map-group {{
+                flex: 1 1 auto !important; width: 100%; min-height: 245px;
+            }}
+        }}
     </style>
     <div class="duration-map">
         <div class="duration-map-root">
@@ -2207,10 +2286,10 @@ def render_overview_tab(df: pd.DataFrame, trend_df: pd.DataFrame = None):
                 </div>
                 <div class="duration-map-children">
                     <div class="duration-map-block" style="flex-grow:{max(recognition_wait, 0.001)}; background:#fac858;" title="识别等待耗时 {format_duration(recognition_wait)}">
-                        识别等待耗时<div class="duration-map-value">{format_duration(recognition_wait)}</div>
+                        <span class="duration-map-label">识别等待耗时</span><div class="duration-map-value">{format_duration(recognition_wait)}</div>
                     </div>
                     <div class="duration-map-block duration-map-actual" style="flex-grow:{max(recognition_actual, 0.001)}; background:#3ba272;" title="识别实际耗时 {format_duration(recognition_actual)}">
-                        <div class="duration-map-actual-title">识别实际耗时 · {format_duration(recognition_actual)}</div>
+                        <div class="duration-map-actual-title"><span class="duration-map-label">识别实际耗时</span> · {format_duration(recognition_actual)}</div>
                         <div class="duration-map-grandchildren">
                             <div class="duration-map-small" style="flex-grow:{max(no_error_weight, 0.001)}; background:#91cc75;" title="无报错时实际耗时 {format_duration(actual_time_stats['avg_recognition_actual_no_error'])}，占比 {no_error_percentage:.1f}%">
                                 无报错<br>{format_duration(actual_time_stats['avg_recognition_actual_no_error'])}<br>{no_error_percentage:.1f}%
@@ -2228,10 +2307,10 @@ def render_overview_tab(df: pd.DataFrame, trend_df: pd.DataFrame = None):
                 </div>
                 <div class="duration-map-children">
                     <div class="duration-map-block" style="flex-grow:{max(bgm_wait, 0.001)}; background:#fc8452;" title="BGM等待耗时 {format_duration(bgm_wait)}">
-                        BGM等待耗时<div class="duration-map-value">{format_duration(bgm_wait)}</div>
+                        <span class="duration-map-label">BGM等待耗时</span><div class="duration-map-value">{format_duration(bgm_wait)}</div>
                     </div>
                     <div class="duration-map-block" style="flex-grow:{max(bgm_actual, 0.001)}; background:#5470c6;" title="BGM实际处理耗时 {format_duration(bgm_actual)}">
-                        BGM实际处理耗时<div class="duration-map-value">{format_duration(bgm_actual)}</div>
+                        <span class="duration-map-label">BGM实际处理耗时</span><div class="duration-map-value">{format_duration(bgm_actual)}</div>
                     </div>
                 </div>
             </div>
@@ -3915,13 +3994,13 @@ def render_upload_statistics_tab(upload_df: pd.DataFrame):
             st.warning(client_status["error"])
 
     st.caption(
-        "统计口径：按上传表任务的创建日期归属；实际自动上传=上传成功/仅视频上传成功/上传失败，"
+        "统计口径：按上传表任务的入表日期归属；实际自动上传=上传成功/仅视频上传成功/上传失败，"
         "且排除备注为“运营手动上传”的任务。实际使用率=实际自动上传数÷入表任务数，"
         "实际成功率=上传成功数÷实际自动上传数。"
     )
 
     if upload_df.empty:
-        st.warning("暂无上传表数据，请检查上传表配置或任务创建时间字段。")
+        st.warning("暂无上传表数据，请检查上传表配置或入表时间字段。")
         return
 
     min_date = upload_df["入表日期"].min()
@@ -4017,7 +4096,7 @@ def render_upload_statistics_tab(upload_df: pd.DataFrame):
     st.markdown("---")
     st.subheader("📉 每日自动上传成功率 / 失败率")
     st.caption(
-        "横轴按任务创建日期统计；实际成功率=上传成功数÷实际自动上传数，"
+        "横轴按任务入表日期统计；实际成功率=上传成功数÷实际自动上传数，"
         "实际失败率=上传失败数÷实际自动上传数。当天没有实际上传时不绘制比率点。"
     )
     rate_scope_options = ["所有系统（合并）"] + sorted(
@@ -5601,6 +5680,21 @@ def main():
         layout="wide"
     )
 
+    # 使用应用内独立视图作为稳定入口，避免部分 Streamlit 版本的
+    # page_link 页面注册数据缺少 url_pathname 而直接抛出 KeyError。
+    if st.session_state.get("production_monitor_view") == "production_status":
+        if st.sidebar.button("← 返回生产监控", key="back_to_production_monitor"):
+            st.session_state["production_monitor_view"] = "monitor"
+            st.rerun()
+
+        from produce_monitor.production_status.status_page import render_status_page
+
+        if hasattr(st, "fragment"):
+            st.fragment(run_every="60s")(render_status_page)()
+        else:
+            render_status_page()
+        return
+
     start_auto_daily_report_scheduler()
 
     # 自定义 CSS
@@ -5637,6 +5731,17 @@ def main():
 
     # ===== 侧边栏：周期筛选 =====
     st.sidebar.title("📅 筛选条件")
+
+    # Production Status 是独立视图，不占用生产监控的 Tab。
+    if st.sidebar.button(
+        "🟢 Production Status",
+        key="open_production_status",
+        help="打开独立的生产系统状态页面",
+        use_container_width=True,
+    ):
+        st.session_state["production_monitor_view"] = "production_status"
+        st.rerun()
+    st.sidebar.markdown("---")
 
     # 生产周期快捷选择，默认当前周期
     st.sidebar.markdown("### 生产周期")
